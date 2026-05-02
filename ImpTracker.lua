@@ -8,14 +8,16 @@ local IMPLOSION_SPELL_ID = 196277
 local POWER_SIPHON_SPELL_ID = 264130
 local CALL_DREADSTALKERS_SPELL_ID = 104316
 local CALL_DREADSTALKERS_CAST_SPELL_ID = 334727
-local GRIMOIRE_FELGUARD_SPELL_ID = 111898
+local GRIMOIRE_SLOT_TRACKING_KEY = "grimoireSlot"
 local SUMMON_DEMONIC_TYRANT_SPELL_ID = 265187
 local SUMMON_DEMONIC_TYRANT_CAST_SPELL_ID = 334585
+local DEMONBOLT_SPELL_ID = 264178
 local DEMONOLOGY_SPEC_ID = 266
 
 local MAX_HAND_OF_GULDAN_IMPS = 3
 local IMPS_REMOVED_PER_IMPLOSION = 6
 local IMPS_REMOVED_PER_POWER_SIPHON = 2
+local DOOMGUARD_DEMONIC_CORE_CDR = 3
 local TYRANT_BASE_WINDOW_DURATION = 15
 local TYRANT_REIGN_BONUS_DURATION = 5
 
@@ -26,12 +28,22 @@ local IMP_FEL_FIREBOLT_CAST_TIME = 2
 local IMP_FIRST_CAST_DELAY = 0.9
 local IMP_HARD_TIMEOUT = 20
 local INNER_DEMON_INTERVAL = 12
+local IMPLOSION_NATIVE_COUNT_FONT_PATH = "Fonts\\FRIZQT__.TTF"
+local IMPLOSION_NATIVE_COUNT_FONT_SIZE = 24
+local IMPLOSION_NATIVE_COUNT_X_OFFSET = -3
+local IMPLOSION_NATIVE_COUNT_Y_OFFSET = 3
+local IMPLOSION_NATIVE_COUNT_COLOR = { 1.00, 0.84, 0.18, 1.00 }
+local IMPLOSION_NATIVE_COUNT_SHADOW_COLOR = { 0, 0, 0, 1.00 }
+local IMPLOSION_NATIVE_COUNT_SHADOW_OFFSET = { 1, -1 }
+local IMPLOSION_NATIVE_COUNT_FONT_FLAGS = "THICKOUTLINE"
+local IMPLOSION_DEBUG_COUNT_COLOR = { 0.22, 1.00, 0.88, 1.00 }
+local IMPLOSION_DEBUG_COUNT_SHADOW_COLOR = { 0, 0, 0, 1.00 }
+local IMPLOSION_DEBUG_COUNT_SHADOW_OFFSET = { 1, -1 }
 
 local FALLBACK_NAMES = {
     wildImpAura = TARGET_AURA_NAME,
     innerDemons = "Inner Demons",
     toHellAndBack = "To Hell and Back",
-    grimoireFelguard = "Grimoire: Felguard",
     grimoireImpLord = "Grimoire: Imp Lord",
     grimoireFelRavager = "Grimoire: Fel Ravager",
     singeMagic = "Singe Magic",
@@ -55,6 +67,7 @@ local defaults = {
     showGrimoireOverlay = true,
     showTyrantOverlay = true,
     showDoomguardOverlay = true,
+    debugImplosionEstimate = false,
     learnedNames = {},
     learnedSpellIDs = {},
 }
@@ -68,6 +81,7 @@ local GetLearnedSpellID
 
 local activeGroups = {}
 local pendingHoG = {}
+local pendingHardcastDemonbolts = {}
 local talentState = {
     innerDemons = false,
     toHellAndBack = false,
@@ -83,6 +97,7 @@ local grimoireTrackedSpellNames = {}
 local grimoireSlotSpellNames = {}
 local tyrantWindowUntil = 0
 local tyrantHoGCount = 0
+local cachedHastePercent = 0
 
 local trackedSpellConfigs = {
     [IMPLOSION_SPELL_ID] = {
@@ -99,7 +114,7 @@ local trackedSpellConfigs = {
         cooldownKey = "dreadstalkersCooldown",
         enabledKey = "showDreadstalkersOverlay",
     },
-    [GRIMOIRE_FELGUARD_SPELL_ID] = {
+    [GRIMOIRE_SLOT_TRACKING_KEY] = {
         cooldownKey = "grimoireCooldown",
         enabledKey = "showGrimoireOverlay",
     },
@@ -112,7 +127,7 @@ local trackedSpellConfigs = {
 local trackedCooldownState = {
     [POWER_SIPHON_SPELL_ID] = { activated = false, readyAt = 0 },
     [CALL_DREADSTALKERS_SPELL_ID] = { activated = false, readyAt = 0 },
-    [GRIMOIRE_FELGUARD_SPELL_ID] = { activated = false, readyAt = 0 },
+    [GRIMOIRE_SLOT_TRACKING_KEY] = { activated = false, readyAt = 0 },
     [SUMMON_DEMONIC_TYRANT_SPELL_ID] = { activated = false, readyAt = 0 },
 }
 
@@ -189,7 +204,6 @@ RebuildLocalizedNameCaches = function()
     localizedNames.innerDemons = GetLearnedName("innerDemons")
     localizedNames.toHellAndBack = GetLearnedName("toHellAndBack")
     localizedNames.reignOfTyranny = GetLearnedName("reignOfTyranny")
-    localizedNames.grimoireFelguard = GetSpellNameByID(GRIMOIRE_FELGUARD_SPELL_ID) or GetLearnedName("grimoireFelguard")
     localizedNames.grimoireImpLord = GetLearnedName("grimoireImpLord")
     localizedNames.grimoireFelRavager = GetLearnedName("grimoireFelRavager")
     localizedNames.singeMagic = GetLearnedName("singeMagic")
@@ -200,7 +214,6 @@ RebuildLocalizedNameCaches = function()
     wipe(grimoireTrackedSpellNames)
     wipe(grimoireSlotSpellNames)
 
-    grimoireTrackedSpellNames[localizedNames.grimoireFelguard] = true
     grimoireTrackedSpellNames[localizedNames.grimoireImpLord] = true
     grimoireTrackedSpellNames[localizedNames.grimoireFelRavager] = true
 
@@ -246,7 +259,7 @@ end
 local function GetTrackedReadySpellIDs()
     local spellIDs = {
         CALL_DREADSTALKERS_SPELL_ID,
-        GRIMOIRE_FELGUARD_SPELL_ID,
+        GRIMOIRE_SLOT_TRACKING_KEY,
         SUMMON_DEMONIC_TYRANT_SPELL_ID,
     }
 
@@ -271,6 +284,149 @@ local function IsOverlayEnabled(spellID)
     return defaults[config.enabledKey] ~= false
 end
 
+local function IsImplosionEstimateDebugEnabled()
+    return db and db.debugImplosionEstimate == true
+end
+
+local function GetChargeCountTextRegion(chargeCount)
+    if not chargeCount then
+        return nil
+    end
+
+    if chargeCount.GetFont and chargeCount.SetFont then
+        return chargeCount
+    end
+
+    if chargeCount.Current and chargeCount.Current.GetFont and chargeCount.Current.SetFont then
+        return chargeCount.Current
+    end
+
+    if chargeCount.Text and chargeCount.Text.GetFont and chargeCount.Text.SetFont then
+        return chargeCount.Text
+    end
+
+    return nil
+end
+
+local function RememberChargeCountStyle(chargeCount)
+    if not chargeCount or chargeCount.ImpTrackerChargeCountStyle then
+        return
+    end
+
+    local textRegion = GetChargeCountTextRegion(chargeCount)
+    if not textRegion then
+        return
+    end
+
+    local fontPath, fontSize, fontFlags = textRegion:GetFont()
+    local points = {}
+    local pointCount = textRegion.GetNumPoints and textRegion:GetNumPoints() or 0
+    for i = 1, pointCount do
+        local point, relativeTo, relativePoint, xOfs, yOfs = textRegion:GetPoint(i)
+        points[i] = {
+            point = point,
+            relativeTo = relativeTo,
+            relativePoint = relativePoint,
+            xOfs = xOfs,
+            yOfs = yOfs,
+        }
+    end
+
+    chargeCount.ImpTrackerChargeCountStyle = {
+        target = textRegion,
+        fontPath = fontPath,
+        fontSize = fontSize,
+        fontFlags = fontFlags,
+        justifyH = textRegion.GetJustifyH and textRegion:GetJustifyH() or nil,
+        justifyV = textRegion.GetJustifyV and textRegion:GetJustifyV() or nil,
+        textColor = textRegion.GetTextColor and { textRegion:GetTextColor() } or nil,
+        shadowColor = textRegion.GetShadowColor and { textRegion:GetShadowColor() } or nil,
+        shadowOffset = textRegion.GetShadowOffset and { textRegion:GetShadowOffset() } or nil,
+        points = points,
+    }
+end
+
+local function RestoreChargeCountStyle(chargeCount)
+    local style = chargeCount and chargeCount.ImpTrackerChargeCountStyle
+    if not style then
+        return
+    end
+
+    local textRegion = style.target or GetChargeCountTextRegion(chargeCount)
+    if not textRegion then
+        return
+    end
+
+    if style.fontPath and style.fontSize then
+        textRegion:SetFont(style.fontPath, style.fontSize, style.fontFlags)
+    end
+
+    if style.justifyH then
+        textRegion:SetJustifyH(style.justifyH)
+    end
+
+    if style.justifyV then
+        textRegion:SetJustifyV(style.justifyV)
+    end
+
+    if style.textColor and textRegion.SetTextColor then
+        textRegion:SetTextColor(unpack(style.textColor))
+    end
+
+    if style.shadowColor and textRegion.SetShadowColor then
+        textRegion:SetShadowColor(unpack(style.shadowColor))
+    end
+
+    if style.shadowOffset and textRegion.SetShadowOffset then
+        textRegion:SetShadowOffset(unpack(style.shadowOffset))
+    end
+
+    textRegion:ClearAllPoints()
+    for _, pointInfo in ipairs(style.points or {}) do
+        textRegion:SetPoint(pointInfo.point, pointInfo.relativeTo, pointInfo.relativePoint, pointInfo.xOfs, pointInfo.yOfs)
+    end
+end
+
+local function SetImplosionChargeCountStyle(itemFrame, enabled, mode)
+    local chargeCount = itemFrame and itemFrame.ChargeCount
+    local textRegion = GetChargeCountTextRegion(chargeCount)
+    if not chargeCount or not textRegion then
+        return
+    end
+
+    RememberChargeCountStyle(chargeCount)
+
+    if enabled then
+        local style = chargeCount.ImpTrackerChargeCountStyle or {}
+        local fontPath = IMPLOSION_NATIVE_COUNT_FONT_PATH or style.fontPath or "Fonts\\FRIZQT__.TTF"
+        local fallbackFontPath = style.fontPath or "Fonts\\FRIZQT__.TTF"
+        local fontSize = IMPLOSION_NATIVE_COUNT_FONT_SIZE
+        local anchor = itemFrame.Icon or itemFrame
+
+        if not textRegion:SetFont(fontPath, fontSize, IMPLOSION_NATIVE_COUNT_FONT_FLAGS) then
+            textRegion:SetFont(fallbackFontPath, fontSize, IMPLOSION_NATIVE_COUNT_FONT_FLAGS)
+        end
+        textRegion:SetJustifyH("RIGHT")
+        textRegion:SetJustifyV("BOTTOM")
+        textRegion:ClearAllPoints()
+        textRegion:SetPoint("BOTTOMRIGHT", anchor, "BOTTOMRIGHT", IMPLOSION_NATIVE_COUNT_X_OFFSET, IMPLOSION_NATIVE_COUNT_Y_OFFSET)
+
+        if textRegion.SetTextColor then
+            textRegion:SetTextColor(unpack(IMPLOSION_NATIVE_COUNT_COLOR))
+        end
+
+        if textRegion.SetShadowColor then
+            textRegion:SetShadowColor(unpack(IMPLOSION_NATIVE_COUNT_SHADOW_COLOR))
+        end
+
+        if textRegion.SetShadowOffset then
+            textRegion:SetShadowOffset(unpack(IMPLOSION_NATIVE_COUNT_SHADOW_OFFSET))
+        end
+    else
+        RestoreChargeCountStyle(chargeCount)
+    end
+end
+
 local function GetPlayerSpecID()
     if not GetSpecialization or not GetSpecializationInfo then
         return nil
@@ -288,21 +444,116 @@ local function IsDemonologySpecActive()
     return GetPlayerSpecID() == DEMONOLOGY_SPEC_ID
 end
 
+-- Retail 12.x can surface "secret" spell identifiers from secure UI widgets.
+-- Treat them as unavailable so table lookups/comparisons do not hard-error.
+local function IsSecretValue(value)
+    local valueType = type(value)
+    if valueType == "nil" then
+        return false
+    end
+
+    if issecretvalue then
+        local ok, result = pcall(issecretvalue, value)
+        if ok and result then
+            return true
+        end
+    end
+
+    if valueType == "table" and issecrettable then
+        local ok, result = pcall(issecrettable, value)
+        if ok and result then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function NormalizeSafeSpellID(spellID)
+    local valueType = type(spellID)
+    if valueType == "nil" or IsSecretValue(spellID) then
+        return nil
+    end
+
+    if valueType == "number" or valueType == "string" then
+        local numericSpellID = tonumber(spellID)
+        if numericSpellID and numericSpellID > 0 then
+            return numericSpellID
+        end
+
+        return nil
+    end
+
+    if valueType == "table" then
+        local extractedSpellID
+        local ok, result = pcall(function()
+            return spellID.spellID or spellID.baseSpellID or spellID.overrideSpellID or spellID.id
+        end)
+        if ok then
+            extractedSpellID = result
+        end
+
+        return NormalizeSafeSpellID(extractedSpellID)
+    end
+
+    return nil
+end
+
+local function NormalizeSafeStringKey(value)
+    local valueType = type(value)
+    if valueType == "nil" or IsSecretValue(value) then
+        return nil
+    end
+
+    if valueType == "string" and value ~= "" then
+        return value
+    end
+
+    return nil
+end
+
+local function NormalizeSafeNumber(value)
+    local valueType = type(value)
+    if valueType == "nil" or IsSecretValue(value) then
+        return nil
+    end
+
+    if valueType == "number" or valueType == "string" then
+        return tonumber(value)
+    end
+
+    return nil
+end
+
+local function GetTrackedFrameSpellID(itemFrame)
+    if not itemFrame or not itemFrame.GetSpellID then
+        return nil
+    end
+
+    local ok, rawSpellID = pcall(itemFrame.GetSpellID, itemFrame)
+    if not ok then
+        return nil
+    end
+
+    return NormalizeSafeSpellID(rawSpellID)
+end
+
 local function GetSpellTextureByID(spellID)
+    spellID = NormalizeSafeSpellID(spellID)
     if not spellID then
         return nil
     end
 
     if C_Spell and C_Spell.GetSpellTexture then
         local ok, texture = pcall(C_Spell.GetSpellTexture, spellID)
-        if ok and texture then
+        if ok and type(texture) ~= "nil" and not IsSecretValue(texture) then
             return texture
         end
     end
 
     if GetSpellTexture then
         local ok, texture = pcall(GetSpellTexture, spellID)
-        if ok and texture then
+        if ok and type(texture) ~= "nil" and not IsSecretValue(texture) then
             return texture
         end
     end
@@ -311,16 +562,23 @@ local function GetSpellTextureByID(spellID)
 end
 
 GetSpellNameByID = function(spellID)
+    spellID = NormalizeSafeSpellID(spellID)
     if not spellID then
         return nil
     end
 
     if C_Spell and C_Spell.GetSpellName then
-        return C_Spell.GetSpellName(spellID)
+        local ok, spellName = pcall(C_Spell.GetSpellName, spellID)
+        if ok and type(spellName) ~= "nil" and not IsSecretValue(spellName) then
+            return spellName
+        end
     end
 
     if GetSpellInfo then
-        return GetSpellInfo(spellID)
+        local ok, spellName = pcall(GetSpellInfo, spellID)
+        if ok and type(spellName) ~= "nil" and not IsSecretValue(spellName) then
+            return spellName
+        end
     end
 
     return nil
@@ -374,7 +632,7 @@ local function RefreshTalentState()
                     local definitionID = entryInfo and entryInfo.definitionID
                     if definitionID then
                         local definitionInfo = C_Traits.GetDefinitionInfo(definitionID)
-                        local spellID = definitionInfo and (definitionInfo.overrideSpellID or definitionInfo.spellID)
+                        local spellID = NormalizeSafeSpellID(definitionInfo and (definitionInfo.overrideSpellID or definitionInfo.spellID))
                         local spellName = GetSpellNameByID(spellID)
 
                         if spellName and (spellName == localizedNames.innerDemons or spellName == FALLBACK_NAMES.innerDemons) then
@@ -415,22 +673,32 @@ local function HasReignOfTyranny()
 end
 
 local function NormalizeTrackedCastSpellID(spellID)
+    spellID = NormalizeSafeSpellID(spellID)
+    if not spellID then
+        return nil
+    end
+
     local normalized = trackedSpellAliases[spellID] or spellID
     local spellName = GetSpellNameByID(normalized)
 
     if spellName and grimoireTrackedSpellNames[spellName] then
-        return GRIMOIRE_FELGUARD_SPELL_ID
+        return GRIMOIRE_SLOT_TRACKING_KEY
     end
 
     return normalized
 end
 
 local function NormalizeTrackedItemSpellID(spellID)
+    spellID = NormalizeSafeSpellID(spellID)
+    if not spellID then
+        return nil
+    end
+
     local normalized = trackedSpellAliases[spellID] or spellID
     local spellName = GetSpellNameByID(normalized)
 
     if spellName and grimoireSlotSpellNames[spellName] then
-        return GRIMOIRE_FELGUARD_SPELL_ID
+        return GRIMOIRE_SLOT_TRACKING_KEY
     end
 
     return normalized
@@ -506,9 +774,64 @@ local function StartEstimatedTrackedCooldown(spellID, now)
     state.readyAt = now + (db[config.cooldownKey] or defaults[config.cooldownKey] or 0)
 end
 
+local function ReduceEstimatedTrackedCooldown(spellID, seconds, now)
+    local state = trackedCooldownState[spellID]
+    local reduction = math.max(0, tonumber(seconds) or 0)
+    if not state or not state.activated or reduction <= 0 then
+        return 0
+    end
+
+    now = now or GetTime()
+    local readyAt = tonumber(state.readyAt) or 0
+    if readyAt <= now then
+        return 0
+    end
+
+    local newReadyAt = math.max(now, readyAt - reduction)
+    local appliedReduction = readyAt - newReadyAt
+    state.readyAt = newReadyAt
+    return appliedReduction
+end
+
+local function ApplyDemonicCoreDoomguardReduction(now)
+    local doomguardSpellID = GetDoomguardSpellID()
+    if not doomguardSpellID then
+        return 0
+    end
+
+    return ReduceEstimatedTrackedCooldown(doomguardSpellID, DOOMGUARD_DEMONIC_CORE_CDR, now)
+end
+
+local function RefreshCachedHastePercent()
+    if not GetHaste then
+        return cachedHastePercent or 0
+    end
+
+    if (InCombatLockdown and InCombatLockdown()) or UnitAffectingCombat("player") then
+        return cachedHastePercent or 0
+    end
+
+    local ok, hastePercent = pcall(function()
+        local value = GetHaste()
+        if type(value) ~= "number" then
+            return nil
+        end
+
+        return value + 0
+    end)
+    if ok and type(hastePercent) == "number" then
+        cachedHastePercent = math.max(0, hastePercent)
+    end
+
+    return cachedHastePercent or 0
+end
+
+local function GetCachedHasteMultiplier()
+    return 1 + (RefreshCachedHastePercent() / 100)
+end
+
 local function GetImpEnergyDecayPerSecond()
-    local hasteMultiplier = 1 + ((GetHaste() or 0) / 100)
-    return (IMP_ENERGY_PER_CAST / IMP_FEL_FIREBOLT_CAST_TIME) * hasteMultiplier
+    return (IMP_ENERGY_PER_CAST / IMP_FEL_FIREBOLT_CAST_TIME) * GetCachedHasteMultiplier()
 end
 
 local function AddGroup(count, source, spawnTime)
@@ -643,7 +966,7 @@ local function ResetEstimate(actualCount, now)
     end
 
     local current = now or GetTime()
-    local hasteMultiplier = 1 + ((GetHaste() or 0) / 100)
+    local hasteMultiplier = GetCachedHasteMultiplier()
     local impliedLifetime = (IMP_CASTS_PER_WILD_IMP * IMP_FEL_FIREBOLT_CAST_TIME) / math.max(0.1, hasteMultiplier)
     local assumedAge = math.max(0, math.min(impliedLifetime * 0.45, impliedLifetime - 0.5))
     AddGroup(count, "sync", current - assumedAge)
@@ -683,6 +1006,9 @@ local function GetWildImpAuraSnapshot()
     local learnedAuraSpellID = GetLearnedSpellID("wildImpAura")
     if learnedAuraSpellID and AuraUtil and AuraUtil.FindAuraBySpellID then
         local ok, name, icon, count, _, _, _, _, _, spellID = pcall(AuraUtil.FindAuraBySpellID, learnedAuraSpellID, "player", "HELPFUL")
+        name = NormalizeSafeStringKey(name)
+        spellID = NormalizeSafeSpellID(spellID)
+        count = NormalizeSafeNumber(count)
         if ok and name then
             RememberName("wildImpAura", name)
             RememberSpellID("wildImpAura", spellID or learnedAuraSpellID)
@@ -693,6 +1019,9 @@ local function GetWildImpAuraSnapshot()
 
     if AuraUtil and AuraUtil.FindAuraByName then
         local ok, name, icon, count, _, _, _, _, _, spellID = pcall(AuraUtil.FindAuraByName, localizedNames.wildImpAura, "player", "HELPFUL")
+        name = NormalizeSafeStringKey(name)
+        spellID = NormalizeSafeSpellID(spellID)
+        count = NormalizeSafeNumber(count)
         if ok and name then
             RememberName("wildImpAura", name)
             RememberSpellID("wildImpAura", spellID)
@@ -703,6 +1032,9 @@ local function GetWildImpAuraSnapshot()
 
     if localizedNames.wildImpAura ~= TARGET_AURA_NAME and AuraUtil and AuraUtil.FindAuraByName then
         local ok, name, icon, count, _, _, _, _, _, spellID = pcall(AuraUtil.FindAuraByName, TARGET_AURA_NAME, "player", "HELPFUL")
+        name = NormalizeSafeStringKey(name)
+        spellID = NormalizeSafeSpellID(spellID)
+        count = NormalizeSafeNumber(count)
         if ok and name then
             RememberName("wildImpAura", name)
             RememberSpellID("wildImpAura", spellID)
@@ -712,6 +1044,9 @@ local function GetWildImpAuraSnapshot()
     end
 
     local ok, name, icon, count, _, _, _, _, _, spellID = pcall(UnitBuff, "player", localizedNames.wildImpAura)
+    name = NormalizeSafeStringKey(name)
+    spellID = NormalizeSafeSpellID(spellID)
+    count = NormalizeSafeNumber(count)
     if ok and name then
         RememberName("wildImpAura", name)
         RememberSpellID("wildImpAura", spellID)
@@ -721,6 +1056,9 @@ local function GetWildImpAuraSnapshot()
 
     if localizedNames.wildImpAura ~= TARGET_AURA_NAME then
         local fallbackOk, fallbackName, fallbackIcon, fallbackCount, _, _, _, _, _, fallbackSpellID = pcall(UnitBuff, "player", TARGET_AURA_NAME)
+        fallbackName = NormalizeSafeStringKey(fallbackName)
+        fallbackSpellID = NormalizeSafeSpellID(fallbackSpellID)
+        fallbackCount = NormalizeSafeNumber(fallbackCount)
         if fallbackOk and fallbackName then
             RememberName("wildImpAura", fallbackName)
             RememberSpellID("wildImpAura", fallbackSpellID)
@@ -731,6 +1069,9 @@ local function GetWildImpAuraSnapshot()
 
     for i = 1, MAX_AURA_SLOTS do
         local okIndex, auraName, auraIcon, auraCount, _, _, _, _, _, auraSpellID = pcall(UnitBuff, "player", i)
+        auraName = NormalizeSafeStringKey(auraName)
+        auraSpellID = NormalizeSafeSpellID(auraSpellID)
+        auraCount = NormalizeSafeNumber(auraCount)
         if not okIndex or not auraName then
             break
         end
@@ -756,7 +1097,7 @@ local function PrintStatus(now)
     print(string.format("|cff9d7dffImpTracker:|r Spec = %s", IsDemonologySpecActive() and "Demonology" or "Other"))
     print(string.format("|cff9d7dffImpTracker:|r Inner Demons = %s | To Hell and Back = %s | Reign of Tyranny = %s", talentState.innerDemons and "on" or "off", talentState.toHellAndBack and "on" or "off", talentState.reignOfTyranny and "on" or "off"))
     print(string.format("|cff9d7dffImpTracker:|r Implosion threshold = %s | Implosion CD = %ss | Ready in %.1fs", tostring(db.implosionThreshold or defaults.implosionThreshold), tostring(db.implosionCooldown or defaults.implosionCooldown), GetEstimatedImplosionRemaining(now)))
-    print(string.format("|cff9d7dffImpTracker:|r Power Siphon ready in %.1fs | Dreadstalkers ready in %.1fs | Grimoire ready in %.1fs | Tyrant ready in %.1fs", GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(CALL_DREADSTALKERS_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(GRIMOIRE_FELGUARD_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now) or 0))
+    print(string.format("|cff9d7dffImpTracker:|r Power Siphon ready in %.1fs | Dreadstalkers ready in %.1fs | Grimoire ready in %.1fs | Tyrant ready in %.1fs", GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(CALL_DREADSTALKERS_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(GRIMOIRE_SLOT_TRACKING_KEY, now) or 0, GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now) or 0))
     print(string.format("|cff9d7dffImpTracker:|r Tyrant window = %s | HoG during Tyrant = %d | Ends in %.1fs", IsTyrantWindowActive(now) and "active" or "idle", tyrantHoGCount or 0, math.max(0, (tyrantWindowUntil or 0) - now)))
 
     local doomguardSpellID = GetDoomguardSpellID()
@@ -814,7 +1155,7 @@ end
 
 GetTrackedItemFrame = function(spellID)
     local cachedFrame = trackedItemFrames[spellID]
-    if cachedFrame and cachedFrame.GetSpellID and NormalizeTrackedItemSpellID(cachedFrame:GetSpellID()) == spellID then
+    if cachedFrame and NormalizeTrackedItemSpellID(GetTrackedFrameSpellID(cachedFrame)) == spellID then
         return cachedFrame
     end
 
@@ -830,7 +1171,7 @@ GetTrackedItemFrame = function(spellID)
     end
 
     for _, itemFrame in ipairs(itemFrames) do
-        local itemSpellID = itemFrame.GetSpellID and itemFrame:GetSpellID()
+        local itemSpellID = GetTrackedFrameSpellID(itemFrame)
         if NormalizeTrackedItemSpellID(itemSpellID) == spellID then
             trackedItemFrames[spellID] = itemFrame
             return itemFrame
@@ -879,6 +1220,19 @@ local function EnsureTrackedOverlay(spellID)
             countText:SetJustifyH("RIGHT")
             countText:SetText("0")
             overlay.CountText = countText
+
+            if spellID == IMPLOSION_SPELL_ID then
+                local debugCountText = overlay:CreateFontString(nil, "OVERLAY")
+                debugCountText:SetFont("Fonts\\FRIZQT__.TTF", 24, "THICKOUTLINE")
+                debugCountText:SetPoint("BOTTOMLEFT", overlay, "BOTTOMLEFT", 2, 2)
+                debugCountText:SetJustifyH("LEFT")
+                debugCountText:SetText("0")
+                debugCountText:SetTextColor(unpack(IMPLOSION_DEBUG_COUNT_COLOR))
+                debugCountText:SetShadowColor(unpack(IMPLOSION_DEBUG_COUNT_SHADOW_COLOR))
+                debugCountText:SetShadowOffset(unpack(IMPLOSION_DEBUG_COUNT_SHADOW_OFFSET))
+                debugCountText:Hide()
+                overlay.DebugCountText = debugCountText
+            end
         end
 
         if spellID == SUMMON_DEMONIC_TYRANT_SPELL_ID then
@@ -902,7 +1256,8 @@ local function EnsureTrackedOverlay(spellID)
     end
 
     if trackedSpellConfigs[spellID] and trackedSpellConfigs[spellID].showCount and itemFrame.ChargeCount then
-        itemFrame.ChargeCount:SetAlpha(0)
+        itemFrame.ChargeCount:SetAlpha(spellID == IMPLOSION_SPELL_ID and 1 or 0)
+        SetImplosionChargeCountStyle(itemFrame, spellID == IMPLOSION_SPELL_ID)
     end
 
     return overlay, itemFrame
@@ -919,7 +1274,7 @@ local function CleanupStaleOverlays()
     end
 
     for _, itemFrame in ipairs(itemFrames) do
-        local rawSpellID = itemFrame.GetSpellID and itemFrame:GetSpellID()
+        local rawSpellID = GetTrackedFrameSpellID(itemFrame)
         local activeSpellID = NormalizeTrackedItemSpellID(rawSpellID)
         local hideChargeCount = false
 
@@ -929,7 +1284,7 @@ local function CleanupStaleOverlays()
 
             if overlay then
                 if activeSpellID == spellID and itemFrame:IsShown() and IsDemonologySpecActive() and IsOverlayEnabled(spellID) then
-                    if config.showCount then
+                    if config.showCount and spellID ~= IMPLOSION_SPELL_ID then
                         hideChargeCount = true
                     end
                 else
@@ -940,23 +1295,24 @@ local function CleanupStaleOverlays()
 
         if itemFrame.ChargeCount then
             itemFrame.ChargeCount:SetAlpha(hideChargeCount and 0 or 1)
+            SetImplosionChargeCountStyle(itemFrame, activeSpellID == IMPLOSION_SPELL_ID and itemFrame:IsShown() and IsDemonologySpecActive() and IsOverlayEnabled(IMPLOSION_SPELL_ID))
         end
     end
 end
 
 local function ObserveGrimoireSlot(now)
-    local itemFrame = GetTrackedItemFrame(GRIMOIRE_FELGUARD_SPELL_ID)
+    local itemFrame = GetTrackedItemFrame(GRIMOIRE_SLOT_TRACKING_KEY)
     if not itemFrame or not itemFrame.GetSpellID then
         lastGrimoireSlotSpellName = nil
         return
     end
 
-    local rawSpellID = itemFrame:GetSpellID()
+    local rawSpellID = GetTrackedFrameSpellID(itemFrame)
     local rawSpellName = GetSpellNameByID(rawSpellID)
-    local grimoireState = trackedCooldownState[GRIMOIRE_FELGUARD_SPELL_ID]
+    local grimoireState = trackedCooldownState[GRIMOIRE_SLOT_TRACKING_KEY]
 
     if grimoireState and (not grimoireState.activated) and lastGrimoireSlotSpellName and grimoireTrackedSpellNames[lastGrimoireSlotSpellName] and (rawSpellName == localizedNames.singeMagic or rawSpellName == localizedNames.spellLock or rawSpellName == FALLBACK_NAMES.singeMagic or rawSpellName == FALLBACK_NAMES.spellLock) then
-        StartEstimatedTrackedCooldown(GRIMOIRE_FELGUARD_SPELL_ID, now)
+        StartEstimatedTrackedCooldown(GRIMOIRE_SLOT_TRACKING_KEY, now)
     end
 
     lastGrimoireSlotSpellName = rawSpellName
@@ -979,13 +1335,39 @@ local function UpdateCountOverlay(spellID, estimated, mode, now)
 
     local count = math.max(0, tonumber(estimated) or 0)
     local countText = overlay.CountText
+    local debugCountText = overlay.DebugCountText
     local border = overlay.Border
+    local usesNativeImplosionCount = spellID == IMPLOSION_SPELL_ID and itemFrame.ChargeCount
+    local showPrimaryOverlayCount = not usesNativeImplosionCount
 
     overlay:Show()
-    countText:SetText(tostring(count))
+    if countText then
+        countText:SetText(tostring(count))
+    end
+
+    if debugCountText then
+        if IsImplosionEstimateDebugEnabled() then
+            debugCountText:SetText(tostring(count))
+            debugCountText:SetTextColor(unpack(IMPLOSION_DEBUG_COUNT_COLOR))
+            debugCountText:SetShadowColor(unpack(IMPLOSION_DEBUG_COUNT_SHADOW_COLOR))
+            debugCountText:SetShadowOffset(unpack(IMPLOSION_DEBUG_COUNT_SHADOW_OFFSET))
+            debugCountText:Show()
+        else
+            debugCountText:Hide()
+        end
+    end
 
     if itemFrame.ChargeCount then
-        itemFrame.ChargeCount:SetAlpha(0)
+        itemFrame.ChargeCount:SetAlpha(usesNativeImplosionCount and 1 or 0)
+        SetImplosionChargeCountStyle(itemFrame, usesNativeImplosionCount, mode)
+    end
+
+    if countText then
+        if showPrimaryOverlayCount then
+            countText:Show()
+        else
+            countText:Hide()
+        end
     end
 
     if mode == "ready" then
@@ -1132,6 +1514,7 @@ local function ResetTrackerState(clearGroups)
     end
 
     wipe(pendingHoG)
+    wipe(pendingHardcastDemonbolts)
     nextInnerDemonAt = nil
     ResetEstimatedCooldowns()
     lastEstimateUpdate = GetTime()
@@ -1143,6 +1526,7 @@ local function UpdateDisplay()
     end
 
     local now = GetTime()
+    RefreshCachedHastePercent()
     UpdateEstimateState(now)
     UpdateTyrantWindowState(now)
     ObserveGrimoireSlot(now)
@@ -1190,7 +1574,7 @@ local overlayOptionEntries = {
     { key = "showImplosionOverlay", label = function() return GetSpellNameByID(IMPLOSION_SPELL_ID) or "Implosion" end },
     { key = "showPowerSiphonOverlay", label = function() return localizedNames.powerSiphon or FALLBACK_NAMES.powerSiphon end },
     { key = "showDreadstalkersOverlay", label = function() return GetSpellNameByID(CALL_DREADSTALKERS_SPELL_ID) or "Call Dreadstalkers" end },
-    { key = "showGrimoireOverlay", label = function() return localizedNames.grimoireFelguard or FALLBACK_NAMES.grimoireFelguard end },
+    { key = "showGrimoireOverlay", label = function() return "Grimoire: Imp Lord / Fel Ravager" end },
     { key = "showTyrantOverlay", label = function() return GetSpellNameByID(SUMMON_DEMONIC_TYRANT_SPELL_ID) or "Summon Demonic Tyrant" end },
     { key = "showDoomguardOverlay", label = function() return localizedNames.summonDoomguard or FALLBACK_NAMES.summonDoomguard end },
 }
@@ -1320,6 +1704,16 @@ SlashCmdList["WILDIMPTRACKER"] = function(msg)
             db.doomguardCooldown = math.max(0, math.min(300, seconds))
             print("|cff9d7dffImpTracker:|r Summon Doomguard cooldown estimate set to " .. tostring(db.doomguardCooldown) .. "s.")
         end
+    elseif cmd == "impdebug" then
+        if arg == "on" or arg == "1" then
+            db.debugImplosionEstimate = true
+        elseif arg == "off" or arg == "0" then
+            db.debugImplosionEstimate = false
+        else
+            db.debugImplosionEstimate = not db.debugImplosionEstimate
+        end
+
+        print("|cff9d7dffImpTracker:|r Implosion debug estimate overlay " .. (db.debugImplosionEstimate and "enabled" or "disabled") .. ".")
     elseif cmd == "options" or cmd == "config" then
         OpenOptionsPanel()
     else
@@ -1413,6 +1807,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         UpdateDisplay()
     elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
         local unit = ...
+        unit = NormalizeSafeStringKey(unit)
         if unit ~= "player" then
             return
         end
@@ -1429,22 +1824,31 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         UpdateDisplay()
     elseif event == "UNIT_AURA" then
         local unit = ...
+        unit = NormalizeSafeStringKey(unit)
         if unit == "player" then
             UpdateDisplay()
         end
     elseif event == "UNIT_SPELLCAST_START" then
         local unit, castGUID, spellID = ...
+        unit = NormalizeSafeStringKey(unit)
+        castGUID = NormalizeSafeStringKey(castGUID)
+        spellID = NormalizeSafeSpellID(spellID)
         if unit ~= "player" then
             return
         end
 
         if spellID == HAND_OF_GULDAN_SPELL_ID and castGUID then
             pendingHoG[castGUID] = MAX_HAND_OF_GULDAN_IMPS
+        elseif spellID == DEMONBOLT_SPELL_ID and castGUID then
+            pendingHardcastDemonbolts[castGUID] = true
         end
 
         UpdateDisplay()
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local unit, castGUID, spellID = ...
+        unit = NormalizeSafeStringKey(unit)
+        castGUID = NormalizeSafeStringKey(castGUID)
+        spellID = NormalizeSafeSpellID(spellID)
         if unit ~= "player" then
             return
         end
@@ -1460,6 +1864,18 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         elseif castSpellName and (castSpellName == localizedNames.summonDoomguard or castSpellName == FALLBACK_NAMES.summonDoomguard) then
             RememberName("summonDoomguard", castSpellName)
             normalizedSpellID = EnsureDoomguardTracking(spellID) or normalizedSpellID
+        end
+
+        if spellID == DEMONBOLT_SPELL_ID then
+            -- Instant Demonbolts arrive without SPELLCAST_START, which lets us
+            -- infer Demonic Core consumption without reading combat-locked auras.
+            local usedDemonicCore = not (castGUID and pendingHardcastDemonbolts[castGUID])
+            if castGUID then
+                pendingHardcastDemonbolts[castGUID] = nil
+            end
+            if usedDemonicCore then
+                ApplyDemonicCoreDoomguardReduction(now)
+            end
         end
 
         if spellID == HAND_OF_GULDAN_SPELL_ID then
@@ -1483,8 +1899,11 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         UpdateDisplay()
     elseif event == "UNIT_SPELLCAST_INTERRUPTED" or event == "UNIT_SPELLCAST_FAILED" then
         local unit, castGUID = ...
+        unit = NormalizeSafeStringKey(unit)
+        castGUID = NormalizeSafeStringKey(castGUID)
         if unit == "player" and castGUID then
             pendingHoG[castGUID] = nil
+            pendingHardcastDemonbolts[castGUID] = nil
         end
         UpdateDisplay()
     end
