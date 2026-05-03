@@ -1,4 +1,4 @@
-## Interface: 120001
+## Interface: 120005
 ## Title: ImpTracker
 ## Notes: Tracks the estimated number of active Wild Imps for Demonology Warlocks.
 ## Author: kosmos with AI assistance

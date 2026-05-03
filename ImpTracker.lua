@@ -8,6 +8,18 @@ local IMPLOSION_SPELL_ID = 196277
 local POWER_SIPHON_SPELL_ID = 264130
 local CALL_DREADSTALKERS_SPELL_ID = 104316
 local CALL_DREADSTALKERS_CAST_SPELL_ID = 334727
+local CALL_DREADSTALKERS_REPLACEMENT_SPELL_IDS = {
+    193331,
+    193332,
+    196273,
+    196274,
+    196281,
+    364750,
+    364751,
+    464880,
+    1217615,
+    1251704,
+}
 local GRIMOIRE_SLOT_TRACKING_KEY = "grimoireSlot"
 local SUMMON_DEMONIC_TYRANT_SPELL_ID = 265187
 local SUMMON_DEMONIC_TYRANT_CAST_SPELL_ID = 334585
@@ -44,10 +56,15 @@ local FALLBACK_NAMES = {
     wildImpAura = TARGET_AURA_NAME,
     innerDemons = "Inner Demons",
     toHellAndBack = "To Hell and Back",
+    spitefulReconstitution = "Spiteful Reconstitution",
+    callDreadstalkers = "Call Dreadstalkers",
+    callGreaterDreadstalker = "Call Greater Dreadstalker",
+    infernalHoundmaster = "Infernal Houndmaster",
     grimoireImpLord = "Grimoire: Imp Lord",
     grimoireFelRavager = "Grimoire: Fel Ravager",
     singeMagic = "Singe Magic",
     spellLock = "Spell Lock",
+    devourMagic = "Devour Magic",
     reignOfTyranny = "Reign of Tyranny",
     powerSiphon = "Power Siphon",
     summonDoomguard = "Summon Doomguard",
@@ -85,6 +102,7 @@ local pendingHardcastDemonbolts = {}
 local talentState = {
     innerDemons = false,
     toHellAndBack = false,
+    spitefulReconstitution = false,
     reignOfTyranny = false,
 }
 
@@ -93,8 +111,10 @@ local nextImplosionReadyAt = 0
 local lastEstimateUpdate = GetTime()
 local startupGraceUntil = 0
 local localizedNames = {}
+local dreadstalkerTrackedSpellNames = {}
 local grimoireTrackedSpellNames = {}
 local grimoireSlotSpellNames = {}
+local grimoireCooldownReplacementNames = {}
 local tyrantWindowUntil = 0
 local tyrantHoGCount = 0
 local cachedHastePercent = 0
@@ -137,6 +157,12 @@ local trackedSpellAliases = {
     [CALL_DREADSTALKERS_CAST_SPELL_ID] = CALL_DREADSTALKERS_SPELL_ID,
     [SUMMON_DEMONIC_TYRANT_CAST_SPELL_ID] = SUMMON_DEMONIC_TYRANT_SPELL_ID,
 }
+
+local trackedItemSpellAliases = {}
+
+for _, spellID in ipairs(CALL_DREADSTALKERS_REPLACEMENT_SPELL_IDS) do
+    trackedItemSpellAliases[spellID] = CALL_DREADSTALKERS_SPELL_ID
+end
 
 local function CopyDefaults(src, dst)
     for key, value in pairs(src) do
@@ -199,30 +225,52 @@ local function RememberSpellID(key, spellID)
     db.learnedSpellIDs[key] = spellID
 end
 
+local function MarkTrackedSpellName(target, name)
+    if name and name ~= "" then
+        target[name] = true
+    end
+end
+
 RebuildLocalizedNameCaches = function()
     localizedNames.wildImpAura = GetLearnedName("wildImpAura")
     localizedNames.innerDemons = GetLearnedName("innerDemons")
     localizedNames.toHellAndBack = GetLearnedName("toHellAndBack")
+    localizedNames.spitefulReconstitution = GetLearnedName("spitefulReconstitution")
     localizedNames.reignOfTyranny = GetLearnedName("reignOfTyranny")
+    localizedNames.callDreadstalkers = GetSpellNameByID(CALL_DREADSTALKERS_SPELL_ID) or GetLearnedName("callDreadstalkers")
+    localizedNames.callGreaterDreadstalker = GetSpellNameByID(1217615) or GetLearnedName("callGreaterDreadstalker")
+    localizedNames.infernalHoundmaster = GetSpellNameByID(1251704) or GetLearnedName("infernalHoundmaster")
     localizedNames.grimoireImpLord = GetLearnedName("grimoireImpLord")
     localizedNames.grimoireFelRavager = GetLearnedName("grimoireFelRavager")
     localizedNames.singeMagic = GetLearnedName("singeMagic")
     localizedNames.spellLock = GetLearnedName("spellLock")
+    localizedNames.devourMagic = GetLearnedName("devourMagic")
     localizedNames.powerSiphon = GetSpellNameByID(POWER_SIPHON_SPELL_ID) or GetLearnedName("powerSiphon")
     localizedNames.summonDoomguard = GetLearnedName("summonDoomguard")
 
+    wipe(dreadstalkerTrackedSpellNames)
     wipe(grimoireTrackedSpellNames)
     wipe(grimoireSlotSpellNames)
+    wipe(grimoireCooldownReplacementNames)
 
-    grimoireTrackedSpellNames[localizedNames.grimoireImpLord] = true
-    grimoireTrackedSpellNames[localizedNames.grimoireFelRavager] = true
+    MarkTrackedSpellName(dreadstalkerTrackedSpellNames, localizedNames.callDreadstalkers)
+    MarkTrackedSpellName(dreadstalkerTrackedSpellNames, localizedNames.callGreaterDreadstalker)
+    MarkTrackedSpellName(dreadstalkerTrackedSpellNames, localizedNames.infernalHoundmaster)
+
+    MarkTrackedSpellName(grimoireTrackedSpellNames, localizedNames.grimoireImpLord)
+    MarkTrackedSpellName(grimoireTrackedSpellNames, localizedNames.grimoireFelRavager)
 
     for name in pairs(grimoireTrackedSpellNames) do
         grimoireSlotSpellNames[name] = true
     end
 
-    grimoireSlotSpellNames[localizedNames.singeMagic] = true
-    grimoireSlotSpellNames[localizedNames.spellLock] = true
+    MarkTrackedSpellName(grimoireCooldownReplacementNames, localizedNames.singeMagic)
+    MarkTrackedSpellName(grimoireCooldownReplacementNames, localizedNames.spellLock)
+    MarkTrackedSpellName(grimoireCooldownReplacementNames, localizedNames.devourMagic)
+
+    for name in pairs(grimoireCooldownReplacementNames) do
+        grimoireSlotSpellNames[name] = true
+    end
 end
 
 local function GetDoomguardSpellID()
@@ -587,6 +635,7 @@ end
 local function RefreshTalentState()
     talentState.innerDemons = false
     talentState.toHellAndBack = false
+    talentState.spitefulReconstitution = false
     talentState.reignOfTyranny = false
 
     if not IsDemonologySpecActive() then
@@ -641,6 +690,9 @@ local function RefreshTalentState()
                         elseif spellName and (spellName == localizedNames.toHellAndBack or spellName == FALLBACK_NAMES.toHellAndBack) then
                             talentState.toHellAndBack = true
                             RememberName("toHellAndBack", spellName)
+                        elseif spellName and (spellName == localizedNames.spitefulReconstitution or spellName == FALLBACK_NAMES.spitefulReconstitution) then
+                            talentState.spitefulReconstitution = true
+                            RememberName("spitefulReconstitution", spellName)
                         elseif spellName and (spellName == localizedNames.reignOfTyranny or spellName == FALLBACK_NAMES.reignOfTyranny) then
                             talentState.reignOfTyranny = true
                             RememberName("reignOfTyranny", spellName)
@@ -694,11 +746,15 @@ local function NormalizeTrackedItemSpellID(spellID)
         return nil
     end
 
-    local normalized = trackedSpellAliases[spellID] or spellID
+    local normalized = trackedItemSpellAliases[spellID] or trackedSpellAliases[spellID] or spellID
     local spellName = GetSpellNameByID(normalized)
 
     if spellName and grimoireSlotSpellNames[spellName] then
         return GRIMOIRE_SLOT_TRACKING_KEY
+    end
+
+    if spellName and dreadstalkerTrackedSpellNames[spellName] then
+        return CALL_DREADSTALKERS_SPELL_ID
     end
 
     return normalized
@@ -1096,6 +1152,7 @@ local function PrintStatus(now)
     print(string.format("|cff9d7dffImpTracker:|r Active groups = %d", #activeGroups))
     print(string.format("|cff9d7dffImpTracker:|r Spec = %s", IsDemonologySpecActive() and "Demonology" or "Other"))
     print(string.format("|cff9d7dffImpTracker:|r Inner Demons = %s | To Hell and Back = %s | Reign of Tyranny = %s", talentState.innerDemons and "on" or "off", talentState.toHellAndBack and "on" or "off", talentState.reignOfTyranny and "on" or "off"))
+    print(string.format("|cff9d7dffImpTracker:|r Spiteful Reconstitution = %s | Random Wild Imp proc not estimated", talentState.spitefulReconstitution and "on" or "off"))
     print(string.format("|cff9d7dffImpTracker:|r Implosion threshold = %s | Implosion CD = %ss | Ready in %.1fs", tostring(db.implosionThreshold or defaults.implosionThreshold), tostring(db.implosionCooldown or defaults.implosionCooldown), GetEstimatedImplosionRemaining(now)))
     print(string.format("|cff9d7dffImpTracker:|r Power Siphon ready in %.1fs | Dreadstalkers ready in %.1fs | Grimoire ready in %.1fs | Tyrant ready in %.1fs", GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(CALL_DREADSTALKERS_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(GRIMOIRE_SLOT_TRACKING_KEY, now) or 0, GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now) or 0))
     print(string.format("|cff9d7dffImpTracker:|r Tyrant window = %s | HoG during Tyrant = %d | Ends in %.1fs", IsTyrantWindowActive(now) and "active" or "idle", tyrantHoGCount or 0, math.max(0, (tyrantWindowUntil or 0) - now)))
@@ -1311,7 +1368,7 @@ local function ObserveGrimoireSlot(now)
     local rawSpellName = GetSpellNameByID(rawSpellID)
     local grimoireState = trackedCooldownState[GRIMOIRE_SLOT_TRACKING_KEY]
 
-    if grimoireState and (not grimoireState.activated) and lastGrimoireSlotSpellName and grimoireTrackedSpellNames[lastGrimoireSlotSpellName] and (rawSpellName == localizedNames.singeMagic or rawSpellName == localizedNames.spellLock or rawSpellName == FALLBACK_NAMES.singeMagic or rawSpellName == FALLBACK_NAMES.spellLock) then
+    if grimoireState and (not grimoireState.activated) and lastGrimoireSlotSpellName and grimoireTrackedSpellNames[lastGrimoireSlotSpellName] and grimoireCooldownReplacementNames[rawSpellName] then
         StartEstimatedTrackedCooldown(GRIMOIRE_SLOT_TRACKING_KEY, now)
     end
 
@@ -1725,20 +1782,12 @@ SlashCmdList["WILDIMPTRACKER"] = function(msg)
 end
 
 local function HandleImplosionCast(now)
-    local removed = RemoveImpCount(IMPS_REMOVED_PER_IMPLOSION, now)
-    if removed > 0 and HasToHellAndBack() then
-        AddGroup(math.floor(removed / 2), "to-hell-and-back", now)
-    end
-
+    RemoveImpCount(IMPS_REMOVED_PER_IMPLOSION, now)
     nextImplosionReadyAt = now + (db.implosionCooldown or defaults.implosionCooldown)
 end
 
 local function HandlePowerSiphonCast(now)
-    local removed = RemoveImpCount(IMPS_REMOVED_PER_POWER_SIPHON, now)
-    if removed > 0 and HasToHellAndBack() then
-        AddGroup(math.floor(removed / 2), "to-hell-and-back", now)
-    end
-
+    RemoveImpCount(IMPS_REMOVED_PER_POWER_SIPHON, now)
     StartEstimatedTrackedCooldown(POWER_SIPHON_SPELL_ID, now)
 end
 
