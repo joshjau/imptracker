@@ -1386,6 +1386,12 @@ local function ObserveGrimoireSlot(now)
     lastGrimoireSlotSpellName = rawSpellName
 end
 
+local function IsGrimoireSummonFrame(itemFrame)
+    local rawSpellID = GetTrackedFrameSpellID(itemFrame)
+    local rawSpellName = GetSpellNameByID(rawSpellID)
+    return rawSpellName and grimoireTrackedSpellNames[rawSpellName]
+end
+
 local function UpdateCountOverlay(spellID, estimated, mode, now)
     if not IsOverlayEnabled(spellID) then
         return
@@ -1481,6 +1487,14 @@ local function UpdateTrackedReadyOverlay(spellID, now)
 
     if not itemFrame:IsShown() or not IsDemonologySpecActive() then
         overlay:Hide()
+        return
+    end
+
+    if spellID == GRIMOIRE_SLOT_TRACKING_KEY and not IsGrimoireSummonFrame(itemFrame) then
+        overlay:Hide()
+        if overlay.Border then
+            overlay.Border:SetBackdropBorderColor(0.20, 1.00, 0.42, 0)
+        end
         return
     end
 
