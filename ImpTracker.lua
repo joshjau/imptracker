@@ -1,8 +1,12 @@
 local ADDON_NAME = ...
 
+-- ImpTracker estimates and decorates Blizzard cooldown icons. Keep it inside
+-- normal addon Lua; no external helpers or hidden-state tricks.
 local TARGET_AURA_NAME = "Wild Imp"
 local MAX_AURA_SLOTS = 255
 
+-- Spell IDs and tuning used by the local Demonology model.
+-- Recheck these when the Midnight spell dump changes.
 local HAND_OF_GULDAN_SPELL_ID = 105174
 local IMPLOSION_SPELL_ID = 196277
 local POWER_SIPHON_SPELL_ID = 264130
@@ -55,7 +59,13 @@ local IMPLOSION_NATIVE_COUNT_FONT_FLAGS = "THICKOUTLINE"
 local IMPLOSION_DEBUG_COUNT_COLOR = { 0.22, 1.00, 0.88, 1.00 }
 local IMPLOSION_DEBUG_COUNT_SHADOW_COLOR = { 0, 0, 0, 1.00 }
 local IMPLOSION_DEBUG_COUNT_SHADOW_OFFSET = { 1, -1 }
+-- Keep this plain; tooltip border art sits badly against Blizzard's masked icons.
+local READY_BORDER_TEXTURE = "Interface\\Buttons\\WHITE8X8"
+local READY_BORDER_COLOR = { 0.20, 1.00, 0.42 }
+local READY_BORDER_OFFSET = 3
+local READY_BORDER_THICKNESS = 2
 
+-- First-load fallbacks. Learned names are cached once the client exposes them.
 local FALLBACK_NAMES = {
     wildImpAura = TARGET_AURA_NAME,
     innerDemons = "Inner Demons",
@@ -100,6 +110,7 @@ local GetTrackedItemFrame
 local RebuildLocalizedNameCaches
 local GetLearnedSpellID
 
+-- Runtime state. Imp counts and cooldowns here are estimates, not server truth.
 local activeGroups = {}
 local pendingHoG = {}
 local pendingHardcastDemonbolts = {}
@@ -174,6 +185,7 @@ for _, spellID in ipairs(CALL_DREADSTALKERS_REPLACEMENT_SPELL_IDS) do
     trackedItemSpellAliases[spellID] = CALL_DREADSTALKERS_SPELL_ID
 end
 
+-- Keep saved data boring; patch behavior belongs in the model below.
 local function CopyDefaults(src, dst)
     for key, value in pairs(src) do
         if type(value) == "table" then
@@ -241,6 +253,8 @@ local function MarkTrackedSpellName(target, name)
     end
 end
 
+-- Cooldown Viewer can show replacement buttons, so names get mapped back to
+-- the stable tracker buckets before the UI layer looks at them.
 RebuildLocalizedNameCaches = function()
     localizedNames.wildImpAura = GetLearnedName("wildImpAura")
     localizedNames.innerDemons = GetLearnedName("innerDemons")
@@ -477,6 +491,70 @@ local function SetImplosionChargeCountStyle(itemFrame, enabled, mode)
     end
 end
 
+local function SetReadyBorderEdge(edge)
+    if edge.SetColorTexture then
+        edge:SetColorTexture(READY_BORDER_COLOR[1], READY_BORDER_COLOR[2], READY_BORDER_COLOR[3], 1)
+    else
+        edge:SetTexture(READY_BORDER_TEXTURE)
+        edge:SetVertexColor(unpack(READY_BORDER_COLOR))
+    end
+    edge:SetAlpha(0)
+    edge:Hide()
+end
+
+local function CreateReadyBorder(parent)
+    local border = { edges = {} }
+
+    -- Four real edges stay crisp at cooldown-manager icon sizes.
+    local top = parent:CreateTexture(nil, "ARTWORK")
+    SetReadyBorderEdge(top)
+    top:SetPoint("TOPLEFT", parent, "TOPLEFT", -READY_BORDER_OFFSET, READY_BORDER_OFFSET)
+    top:SetPoint("TOPRIGHT", parent, "TOPRIGHT", READY_BORDER_OFFSET, READY_BORDER_OFFSET)
+    top:SetHeight(READY_BORDER_THICKNESS)
+    border.edges[#border.edges + 1] = top
+
+    local bottom = parent:CreateTexture(nil, "ARTWORK")
+    SetReadyBorderEdge(bottom)
+    bottom:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", -READY_BORDER_OFFSET, -READY_BORDER_OFFSET)
+    bottom:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", READY_BORDER_OFFSET, -READY_BORDER_OFFSET)
+    bottom:SetHeight(READY_BORDER_THICKNESS)
+    border.edges[#border.edges + 1] = bottom
+
+    local left = parent:CreateTexture(nil, "ARTWORK")
+    SetReadyBorderEdge(left)
+    left:SetPoint("TOPLEFT", top, "BOTTOMLEFT", 0, 0)
+    left:SetPoint("BOTTOMLEFT", bottom, "TOPLEFT", 0, 0)
+    left:SetWidth(READY_BORDER_THICKNESS)
+    border.edges[#border.edges + 1] = left
+
+    local right = parent:CreateTexture(nil, "ARTWORK")
+    SetReadyBorderEdge(right)
+    right:SetPoint("TOPRIGHT", top, "BOTTOMRIGHT", 0, 0)
+    right:SetPoint("BOTTOMRIGHT", bottom, "TOPRIGHT", 0, 0)
+    right:SetWidth(READY_BORDER_THICKNESS)
+    border.edges[#border.edges + 1] = right
+
+    return border
+end
+
+local function SetReadyBorderAlpha(border, alpha)
+    if not border then
+        return
+    end
+
+    alpha = math.max(0, math.min(1, tonumber(alpha) or 0))
+
+    for _, edge in ipairs(border.edges or {}) do
+        edge:SetAlpha(alpha)
+
+        if alpha > 0 then
+            edge:Show()
+        else
+            edge:Hide()
+        end
+    end
+end
+
 local function GetPlayerSpecID()
     if not GetSpecialization or not GetSpecializationInfo then
         return nil
@@ -634,6 +712,8 @@ GetSpellNameByID = function(spellID)
     return nil
 end
 
+-- Talent scans are best-effort through normal spellbook surfaces. "Not seen"
+-- means not modeled right now, not proof Blizzard removed the spell.
 local function RefreshTalentState()
     talentState.innerDemons = false
     talentState.toHellAndBack = false
@@ -771,6 +851,8 @@ local function NormalizeTrackedItemSpellID(spellID)
     return normalized
 end
 
+-- Cooldowns are local estimates from casts and checked talent text. Do not swap
+-- this for live combat cooldown reads without retesting Midnight secret values.
 local function GetEstimatedImplosionRemaining(now)
     now = now or GetTime()
     return math.max(0, (nextImplosionReadyAt or 0) - now)
@@ -893,6 +975,8 @@ local function RefreshCachedHastePercent()
     return cachedHastePercent or 0
 end
 
+-- Wild Imp count is modeled as timed groups, then resynced when normal aura
+-- reads are safe again.
 local function GetCachedHasteMultiplier()
     return 1 + (RefreshCachedHastePercent() / 100)
 end
@@ -1065,6 +1149,7 @@ local function ResyncEstimate(actualCount, now)
     end
 end
 
+-- Friendly resync path only. In combat, let the local model carry the display.
 local function GetWildImpAuraSnapshot()
     if (InCombatLockdown and InCombatLockdown()) or UnitAffectingCombat("player") then
         return 0, nil, nil
@@ -1249,6 +1334,8 @@ GetTrackedItemFrame = function(spellID)
     return nil
 end
 
+-- UI layer: decorate Blizzard's Cooldown Viewer frames only. Keep it visual and
+-- cheap; the estimate logic stays above this point.
 local function EnsureTrackedOverlay(spellID)
     if not IsOverlayEnabled(spellID) then
         return nil
@@ -1271,15 +1358,7 @@ local function EnsureTrackedOverlay(spellID)
         overlay:SetFrameLevel((anchor.GetFrameLevel and anchor:GetFrameLevel()) or (itemFrame:GetFrameLevel() + 8))
         overlay:EnableMouse(false)
 
-        local border = CreateFrame("Frame", nil, overlay, "BackdropTemplate")
-        border:SetPoint("TOPLEFT", overlay, "TOPLEFT", -5, 5)
-        border:SetPoint("BOTTOMRIGHT", overlay, "BOTTOMRIGHT", 5, -5)
-        border:SetBackdrop({
-            edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-            edgeSize = 11,
-        })
-        border:SetBackdropBorderColor(0.20, 1.00, 0.40, 0)
-        overlay.Border = border
+        overlay.Border = CreateReadyBorder(overlay)
 
         if trackedSpellConfigs[spellID] and trackedSpellConfigs[spellID].showCount then
             local countText = overlay:CreateFontString(nil, "OVERLAY")
@@ -1386,6 +1465,8 @@ local function ObserveGrimoireSlot(now)
     lastGrimoireSlotSpellName = rawSpellName
 end
 
+-- Grimoire turns into utility buttons on cooldown. Track the slot by name, but
+-- only show ready guidance when the visible button is an actual summon.
 local function IsGrimoireSummonFrame(itemFrame)
     local rawSpellID = GetTrackedFrameSpellID(itemFrame)
     local rawSpellName = GetSpellNameByID(rawSpellID)
@@ -1446,17 +1527,25 @@ local function UpdateCountOverlay(spellID, estimated, mode, now)
 
     if mode == "ready" then
         local pulse = 0.70 + (0.30 * math.abs(math.sin((now or GetTime()) * 5.5)))
-        countText:SetTextColor(0.92, 1.00, 0.95)
-        border:SetBackdropBorderColor(0.20, 1.00, 0.42, 0.75 + (0.25 * pulse))
+        if countText then
+            countText:SetTextColor(0.92, 1.00, 0.95)
+        end
+        SetReadyBorderAlpha(border, 0.75 + (0.25 * pulse))
     elseif mode == "building" then
-        countText:SetTextColor(1.00, 0.88, 0.56)
-        border:SetBackdropBorderColor(0.20, 1.00, 0.42, 0)
+        if countText then
+            countText:SetTextColor(1.00, 0.88, 0.56)
+        end
+        SetReadyBorderAlpha(border, 0)
     elseif mode == "offspec" then
-        countText:SetTextColor(0.55, 0.55, 0.60)
-        border:SetBackdropBorderColor(0.20, 1.00, 0.42, 0)
+        if countText then
+            countText:SetTextColor(0.55, 0.55, 0.60)
+        end
+        SetReadyBorderAlpha(border, 0)
     else
-        countText:SetTextColor(0.84, 0.96, 1.00)
-        border:SetBackdropBorderColor(0.20, 1.00, 0.42, 0)
+        if countText then
+            countText:SetTextColor(0.84, 0.96, 1.00)
+        end
+        SetReadyBorderAlpha(border, 0)
     end
 end
 
@@ -1493,7 +1582,7 @@ local function UpdateTrackedReadyOverlay(spellID, now)
     if spellID == GRIMOIRE_SLOT_TRACKING_KEY and not IsGrimoireSummonFrame(itemFrame) then
         overlay:Hide()
         if overlay.Border then
-            overlay.Border:SetBackdropBorderColor(0.20, 1.00, 0.42, 0)
+            SetReadyBorderAlpha(overlay.Border, 0)
         end
         return
     end
@@ -1503,9 +1592,9 @@ local function UpdateTrackedReadyOverlay(spellID, now)
     local border = overlay.Border
     if IsEstimatedTrackedCooldownReady(spellID, now) then
         local pulse = 0.70 + (0.30 * math.abs(math.sin((now or GetTime()) * 5.5)))
-        border:SetBackdropBorderColor(0.20, 1.00, 0.42, 0.75 + (0.25 * pulse))
+        SetReadyBorderAlpha(border, 0.75 + (0.25 * pulse))
     else
-        border:SetBackdropBorderColor(0.20, 1.00, 0.42, 0)
+        SetReadyBorderAlpha(border, 0)
     end
 end
 
@@ -1602,6 +1691,8 @@ local function ResetTrackerState(clearGroups)
     lastEstimateUpdate = GetTime()
 end
 
+-- Main refresh path. Light display updates can run often; structural cleanup is
+-- forced after layout/spec changes or throttled during normal ticks.
 local function UpdateDisplay(forceStructuralCleanup)
     if not db then
         return
@@ -1656,6 +1747,8 @@ end
 
 local optionsPanel
 local optionsCategory
+
+-- Small config surface for testing and tuning without editing saved variables.
 local overlayOptionEntries = {
     { key = "showImplosionOverlay", label = function() return GetSpellNameByID(IMPLOSION_SPELL_ID) or "Implosion" end },
     { key = "showPowerSiphonOverlay", label = function() return localizedNames.powerSiphon or FALLBACK_NAMES.powerSiphon end },
@@ -1750,6 +1843,7 @@ local function OpenOptionsPanel()
     end
 end
 
+-- Slash commands are intentionally plain: useful while testing, not a second UI.
 SLASH_WILDIMPTRACKER1 = "/wit"
 SLASH_WILDIMPTRACKER2 = "/itr"
 SlashCmdList["WILDIMPTRACKER"] = function(msg)
@@ -1830,6 +1924,7 @@ local function HandlePowerSiphonCast(now)
     StartEstimatedTrackedCooldown(POWER_SIPHON_SPELL_ID, now)
 end
 
+-- Blizzard owns layout. Rebuild cached frame links after it moves things.
 local function HookCooldownViewer()
     if not EssentialCooldownViewer or EssentialCooldownViewer.ImpTrackerHooked or not EssentialCooldownViewer.GetItemFrames then
         return
@@ -1843,6 +1938,8 @@ local function HookCooldownViewer()
     end)
 end
 
+-- Player-only event wiring. Normalize incoming values before comparing them;
+-- some Midnight surfaces can hand addon Lua protected values.
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
