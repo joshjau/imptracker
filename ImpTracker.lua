@@ -29,6 +29,8 @@ local DEMONOLOGY_SPEC_ID = 266
 local MAX_HAND_OF_GULDAN_IMPS = 3
 local IMPS_REMOVED_PER_IMPLOSION = 6
 local IMPS_REMOVED_PER_POWER_SIPHON = 2
+local TO_HELL_AND_BACK_IMPS_PER_BATCH = 1
+local TO_HELL_AND_BACK_SACRIFICE_BATCH_SIZE = 2
 local DOOMGUARD_DEMONIC_CORE_CDR = 3
 local TYRANT_BASE_WINDOW_DURATION = 15
 local TYRANT_REIGN_BONUS_DURATION = 5
@@ -718,6 +720,15 @@ end
 
 local function HasToHellAndBack()
     return IsDemonologySpecActive() and talentState.toHellAndBack
+end
+
+local function GetToHellAndBackReplacementCount(removedCount)
+    if not HasToHellAndBack() then
+        return 0
+    end
+
+    local sacrificed = math.max(0, tonumber(removedCount) or 0)
+    return math.floor(sacrificed / TO_HELL_AND_BACK_SACRIFICE_BATCH_SIZE) * TO_HELL_AND_BACK_IMPS_PER_BATCH
 end
 
 local function HasReignOfTyranny()
@@ -1782,12 +1793,22 @@ SlashCmdList["WILDIMPTRACKER"] = function(msg)
 end
 
 local function HandleImplosionCast(now)
-    RemoveImpCount(IMPS_REMOVED_PER_IMPLOSION, now)
+    local removed = RemoveImpCount(IMPS_REMOVED_PER_IMPLOSION, now)
+    local replacementCount = GetToHellAndBackReplacementCount(removed)
+    if replacementCount > 0 then
+        AddGroup(replacementCount, "to-hell-and-back", now)
+    end
+
     nextImplosionReadyAt = now + (db.implosionCooldown or defaults.implosionCooldown)
 end
 
 local function HandlePowerSiphonCast(now)
-    RemoveImpCount(IMPS_REMOVED_PER_POWER_SIPHON, now)
+    local removed = RemoveImpCount(IMPS_REMOVED_PER_POWER_SIPHON, now)
+    local replacementCount = GetToHellAndBackReplacementCount(removed)
+    if replacementCount > 0 then
+        AddGroup(replacementCount, "to-hell-and-back", now)
+    end
+
     StartEstimatedTrackedCooldown(POWER_SIPHON_SPELL_ID, now)
 end
 
