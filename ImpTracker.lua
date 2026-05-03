@@ -1,5 +1,18 @@
 local ADDON_NAME = ...
 
+local math = math
+local table = table
+local string = string
+local ipairs = ipairs
+local pairs = pairs
+local tonumber = tonumber
+local tostring = tostring
+local type = type
+local unpack = unpack
+local GetTime = GetTime
+local InCombatLockdown = InCombatLockdown
+local UnitAffectingCombat = UnitAffectingCombat
+
 -- ImpTracker estimates and decorates Blizzard cooldown icons. Keep it inside
 -- normal addon Lua; no external helpers or hidden-state tricks.
 local TARGET_AURA_NAME = "Wild Imp"
@@ -130,6 +143,11 @@ local dreadstalkerTrackedSpellNames = {}
 local grimoireTrackedSpellNames = {}
 local grimoireSlotSpellNames = {}
 local grimoireCooldownReplacementNames = {}
+local spellNameCache = {}
+local spellTextureCache = {}
+local overlayKeyCache = {}
+local isDemonologyActive = false
+local specStateKnown = false
 local tyrantWindowUntil = 0
 local tyrantHoGCount = 0
 local cachedHastePercent = 0
@@ -451,14 +469,20 @@ local function RestoreChargeCountStyle(chargeCount)
     end
 end
 
-local function SetImplosionChargeCountStyle(itemFrame, enabled, mode)
+local function SetImplosionChargeCountStyle(itemFrame, enabled, mode, force)
     local chargeCount = itemFrame and itemFrame.ChargeCount
     local textRegion = GetChargeCountTextRegion(chargeCount)
     if not chargeCount or not textRegion then
         return
     end
 
+    enabled = enabled and true or false
+    if chargeCount.ImpTrackerChargeCountStyleEnabled == enabled and (not force or not enabled) then
+        return
+    end
+
     RememberChargeCountStyle(chargeCount)
+    chargeCount.ImpTrackerChargeCountStyleEnabled = enabled
 
     if enabled then
         local style = chargeCount.ImpTrackerChargeCountStyle or {}
@@ -543,6 +567,11 @@ local function SetReadyBorderAlpha(border, alpha)
     end
 
     alpha = math.max(0, math.min(1, tonumber(alpha) or 0))
+    if border.ImpTrackerAlpha == alpha then
+        return
+    end
+
+    border.ImpTrackerAlpha = alpha
 
     for _, edge in ipairs(border.edges or {}) do
         edge:SetAlpha(alpha)
@@ -568,8 +597,25 @@ local function GetPlayerSpecID()
     return GetSpecializationInfo(specIndex)
 end
 
+local function RefreshSpecState()
+    local specID = GetPlayerSpecID()
+    if not specID then
+        isDemonologyActive = false
+        specStateKnown = false
+        return false
+    end
+
+    isDemonologyActive = specID == DEMONOLOGY_SPEC_ID
+    specStateKnown = true
+    return isDemonologyActive
+end
+
 local function IsDemonologySpecActive()
-    return GetPlayerSpecID() == DEMONOLOGY_SPEC_ID
+    if not specStateKnown then
+        return RefreshSpecState()
+    end
+
+    return isDemonologyActive
 end
 
 -- Retail 12.x can surface "secret" spell identifiers from secure UI widgets.
@@ -672,9 +718,15 @@ local function GetSpellTextureByID(spellID)
         return nil
     end
 
+    local cachedTexture = spellTextureCache[spellID]
+    if cachedTexture ~= nil then
+        return cachedTexture
+    end
+
     if C_Spell and C_Spell.GetSpellTexture then
         local ok, texture = pcall(C_Spell.GetSpellTexture, spellID)
         if ok and type(texture) ~= "nil" and not IsSecretValue(texture) then
+            spellTextureCache[spellID] = texture
             return texture
         end
     end
@@ -682,6 +734,7 @@ local function GetSpellTextureByID(spellID)
     if GetSpellTexture then
         local ok, texture = pcall(GetSpellTexture, spellID)
         if ok and type(texture) ~= "nil" and not IsSecretValue(texture) then
+            spellTextureCache[spellID] = texture
             return texture
         end
     end
@@ -695,9 +748,15 @@ GetSpellNameByID = function(spellID)
         return nil
     end
 
+    local cachedName = spellNameCache[spellID]
+    if cachedName ~= nil then
+        return cachedName
+    end
+
     if C_Spell and C_Spell.GetSpellName then
         local ok, spellName = pcall(C_Spell.GetSpellName, spellID)
         if ok and type(spellName) ~= "nil" and not IsSecretValue(spellName) then
+            spellNameCache[spellID] = spellName
             return spellName
         end
     end
@@ -705,6 +764,7 @@ GetSpellNameByID = function(spellID)
     if GetSpellInfo then
         local ok, spellName = pcall(GetSpellInfo, spellID)
         if ok and type(spellName) ~= "nil" and not IsSecretValue(spellName) then
+            spellNameCache[spellID] = spellName
             return spellName
         end
     end
@@ -719,6 +779,8 @@ local function RefreshTalentState()
     talentState.toHellAndBack = false
     talentState.spitefulReconstitution = false
     talentState.reignOfTyranny = false
+
+    RefreshSpecState()
 
     if not IsDemonologySpecActive() then
         return
@@ -1336,6 +1398,16 @@ end
 
 -- UI layer: decorate Blizzard's Cooldown Viewer frames only. Keep it visual and
 -- cheap; the estimate logic stays above this point.
+local function GetOverlayKey(spellID)
+    local overlayKey = overlayKeyCache[spellID]
+    if not overlayKey then
+        overlayKey = "ImpTrackerOverlay" .. tostring(spellID)
+        overlayKeyCache[spellID] = overlayKey
+    end
+
+    return overlayKey
+end
+
 local function EnsureTrackedOverlay(spellID)
     if not IsOverlayEnabled(spellID) then
         return nil
@@ -1346,7 +1418,7 @@ local function EnsureTrackedOverlay(spellID)
         return nil
     end
 
-    local overlayKey = "ImpTrackerOverlay" .. tostring(spellID)
+    local overlayKey = GetOverlayKey(spellID)
     local overlay = itemFrame[overlayKey]
 
     if not overlay then
@@ -1426,7 +1498,7 @@ local function CleanupStaleOverlays()
         local hideChargeCount = false
 
         for spellID, config in pairs(trackedSpellConfigs) do
-            local overlayKey = "ImpTrackerOverlay" .. tostring(spellID)
+            local overlayKey = GetOverlayKey(spellID)
             local overlay = itemFrame[overlayKey]
 
             if overlay then
@@ -1442,7 +1514,7 @@ local function CleanupStaleOverlays()
 
         if itemFrame.ChargeCount then
             itemFrame.ChargeCount:SetAlpha(hideChargeCount and 0 or 1)
-            SetImplosionChargeCountStyle(itemFrame, activeSpellID == IMPLOSION_SPELL_ID and itemFrame:IsShown() and IsDemonologySpecActive() and IsOverlayEnabled(IMPLOSION_SPELL_ID))
+            SetImplosionChargeCountStyle(itemFrame, activeSpellID == IMPLOSION_SPELL_ID and itemFrame:IsShown() and IsDemonologySpecActive() and IsOverlayEnabled(IMPLOSION_SPELL_ID), nil, true)
         end
     end
 end
@@ -1561,7 +1633,7 @@ local function UpdateTrackedReadyOverlay(spellID, now)
     if not IsOverlayEnabled(spellID) then
         local itemFrame = GetTrackedItemFrame(spellID)
         if itemFrame then
-            local overlay = itemFrame["ImpTrackerOverlay" .. tostring(spellID)]
+            local overlay = itemFrame[GetOverlayKey(spellID)]
             if overlay then
                 overlay:Hide()
             end
