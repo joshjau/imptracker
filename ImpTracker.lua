@@ -34,6 +34,8 @@ local TO_HELL_AND_BACK_SACRIFICE_BATCH_SIZE = 2
 local DOOMGUARD_DEMONIC_CORE_CDR = 3
 local TYRANT_BASE_WINDOW_DURATION = 15
 local TYRANT_REIGN_BONUS_DURATION = 5
+local DISPLAY_UPDATE_INTERVAL = 0.10
+local STRUCTURAL_CLEANUP_INTERVAL = 0.50
 
 local IMP_START_ENERGY = 100
 local IMP_ENERGY_PER_CAST = 20
@@ -120,6 +122,7 @@ local grimoireCooldownReplacementNames = {}
 local tyrantWindowUntil = 0
 local tyrantHoGCount = 0
 local cachedHastePercent = 0
+local lastStructuralCleanupAt = 0
 
 local trackedSpellConfigs = {
     [IMPLOSION_SPELL_ID] = {
@@ -154,6 +157,11 @@ local trackedCooldownState = {
 }
 
 local lastGrimoireSlotSpellName
+local trackedReadySpellIDs = {
+    CALL_DREADSTALKERS_SPELL_ID,
+    GRIMOIRE_SLOT_TRACKING_KEY,
+    SUMMON_DEMONIC_TYRANT_SPELL_ID,
+}
 
 local trackedSpellAliases = {
     [CALL_DREADSTALKERS_CAST_SPELL_ID] = CALL_DREADSTALKERS_SPELL_ID,
@@ -307,18 +315,10 @@ local function EnsureDoomguardTracking(spellID)
 end
 
 local function GetTrackedReadySpellIDs()
-    local spellIDs = {
-        CALL_DREADSTALKERS_SPELL_ID,
-        GRIMOIRE_SLOT_TRACKING_KEY,
-        SUMMON_DEMONIC_TYRANT_SPELL_ID,
-    }
-
     local doomguardSpellID = GetDoomguardSpellID()
-    if doomguardSpellID then
-        table.insert(spellIDs, doomguardSpellID)
-    end
+    trackedReadySpellIDs[4] = doomguardSpellID
 
-    return spellIDs
+    return trackedReadySpellIDs
 end
 
 local function IsOverlayEnabled(spellID)
@@ -1588,7 +1588,7 @@ local function ResetTrackerState(clearGroups)
     lastEstimateUpdate = GetTime()
 end
 
-local function UpdateDisplay()
+local function UpdateDisplay(forceStructuralCleanup)
     if not db then
         return
     end
@@ -1598,7 +1598,11 @@ local function UpdateDisplay()
     UpdateEstimateState(now)
     UpdateTyrantWindowState(now)
     ObserveGrimoireSlot(now)
-    CleanupStaleOverlays()
+
+    if forceStructuralCleanup or (now - (lastStructuralCleanupAt or 0)) >= STRUCTURAL_CLEANUP_INTERVAL then
+        CleanupStaleOverlays()
+        lastStructuralCleanupAt = now
+    end
 
     if not IsDemonologySpecActive() then
         wipe(activeGroups)
@@ -1698,7 +1702,7 @@ local function EnsureOptionsPanel()
         checkButton:SetScript("OnClick", function(self)
             EnsureDB()
             db[option.key] = self:GetChecked() and true or false
-            UpdateDisplay()
+            UpdateDisplay(true)
         end)
 
         optionsPanel.checkButtons[option.key] = checkButton
@@ -1820,9 +1824,8 @@ local function HookCooldownViewer()
     EssentialCooldownViewer.ImpTrackerHooked = true
     hooksecurefunc(EssentialCooldownViewer, "Layout", function()
         wipe(trackedItemFrames)
-        CleanupStaleOverlays()
         EnsureAllTrackedOverlays()
-        UpdateDisplay()
+        UpdateDisplay(true)
     end)
 end
 
@@ -1859,7 +1862,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         EnsureAllTrackedOverlays()
         startupGraceUntil = GetTime() + 3
         lastEstimateUpdate = GetTime()
-        UpdateDisplay()
+        UpdateDisplay(true)
         print("|cff9d7dffImpTracker:|r Loaded. Enhancing Blizzard cooldown icons.")
     elseif event == "PLAYER_ENTERING_WORLD" then
         HookCooldownViewer()
@@ -1868,7 +1871,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         RefreshTalentState()
         EnsureDoomguardTracking(GetDoomguardSpellID())
         startupGraceUntil = GetTime() + 3
-        UpdateDisplay()
+        UpdateDisplay(true)
     elseif event == "PLAYER_REGEN_DISABLED" then
         lastEstimateUpdate = GetTime()
         UpdateDisplay()
@@ -1885,13 +1888,13 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         RefreshTalentState()
         EnsureDoomguardTracking(GetDoomguardSpellID())
         ResetTrackerState(true)
-        UpdateDisplay()
+        UpdateDisplay(true)
     elseif event == "PLAYER_TALENT_UPDATE" or event == "TRAIT_CONFIG_UPDATED" then
         RefreshTalentState()
         EnsureDoomguardTracking(GetDoomguardSpellID())
         nextInnerDemonAt = nil
         UpdateTyrantWindowState()
-        UpdateDisplay()
+        UpdateDisplay(true)
     elseif event == "UNIT_AURA" then
         local unit = ...
         unit = NormalizeSafeStringKey(unit)
@@ -1979,6 +1982,6 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     end
 end)
 
-C_Timer.NewTicker(0.20, function()
+C_Timer.NewTicker(DISPLAY_UPDATE_INTERVAL, function()
     UpdateDisplay()
 end)
