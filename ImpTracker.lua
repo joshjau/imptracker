@@ -41,9 +41,11 @@ local GRIMOIRE_SLOT_TRACKING_KEY = "grimoireSlot"
 local SUMMON_DEMONIC_TYRANT_SPELL_ID = 265187
 local SUMMON_DEMONIC_TYRANT_CAST_SPELL_ID = 334585
 local DEMONBOLT_SPELL_ID = 264178
+local RUINATION_SPELL_ID = 434635
 local DEMONOLOGY_SPEC_ID = 266
 
 local MAX_HAND_OF_GULDAN_IMPS = 3
+local RUINATION_WILD_IMPS = 3
 local IMPS_REMOVED_PER_IMPLOSION = 6
 local IMPS_REMOVED_PER_POWER_SIPHON = 2
 local TO_HELL_AND_BACK_IMPS_PER_BATCH = 1
@@ -53,6 +55,7 @@ local TYRANT_BASE_WINDOW_DURATION = 15
 local TYRANT_REIGN_BONUS_DURATION = 5
 local DISPLAY_UPDATE_INTERVAL = 0.10
 local STRUCTURAL_CLEANUP_INTERVAL = 0.50
+local COMPLETED_WILD_IMP_CAST_CACHE_LIMIT = 24
 
 local IMP_START_ENERGY = 100
 local IMP_ENERGY_PER_CAST = 20
@@ -74,9 +77,12 @@ local IMPLOSION_DEBUG_COUNT_SHADOW_COLOR = { 0, 0, 0, 1.00 }
 local IMPLOSION_DEBUG_COUNT_SHADOW_OFFSET = { 1, -1 }
 -- Keep this plain; tooltip border art sits badly against Blizzard's masked icons.
 local READY_BORDER_TEXTURE = "Interface\\Buttons\\WHITE8X8"
-local READY_BORDER_COLOR = { 0.20, 1.00, 0.42 }
-local READY_BORDER_OFFSET = 3
-local READY_BORDER_THICKNESS = 2
+local READY_BORDER_COLOR = { 0.32, 1.00, 0.52 }
+local READY_BORDER_INSET = 1
+local READY_BORDER_THICKNESS = 1
+local READY_BORDER_BASE_ALPHA = 0.38
+local READY_BORDER_PULSE_ALPHA = 0.18
+local READY_BORDER_PULSE_SPEED = 4.25
 
 -- First-load fallbacks. Learned names are cached once the client exposes them.
 local FALLBACK_NAMES = {
@@ -126,6 +132,8 @@ local GetLearnedSpellID
 -- Runtime state. Imp counts and cooldowns here are estimates, not server truth.
 local activeGroups = {}
 local pendingHoG = {}
+local completedWildImpSummonCasts = {}
+local completedWildImpSummonCastOrder = {}
 local pendingHardcastDemonbolts = {}
 local talentState = {
     innerDemons = false,
@@ -529,18 +537,18 @@ end
 local function CreateReadyBorder(parent)
     local border = { edges = {} }
 
-    -- Four real edges stay crisp at cooldown-manager icon sizes.
+    -- Four inside edges stay crisp without bleeding into neighboring icons.
     local top = parent:CreateTexture(nil, "ARTWORK")
     SetReadyBorderEdge(top)
-    top:SetPoint("TOPLEFT", parent, "TOPLEFT", -READY_BORDER_OFFSET, READY_BORDER_OFFSET)
-    top:SetPoint("TOPRIGHT", parent, "TOPRIGHT", READY_BORDER_OFFSET, READY_BORDER_OFFSET)
+    top:SetPoint("TOPLEFT", parent, "TOPLEFT", READY_BORDER_INSET, -READY_BORDER_INSET)
+    top:SetPoint("TOPRIGHT", parent, "TOPRIGHT", -READY_BORDER_INSET, -READY_BORDER_INSET)
     top:SetHeight(READY_BORDER_THICKNESS)
     border.edges[#border.edges + 1] = top
 
     local bottom = parent:CreateTexture(nil, "ARTWORK")
     SetReadyBorderEdge(bottom)
-    bottom:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", -READY_BORDER_OFFSET, -READY_BORDER_OFFSET)
-    bottom:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", READY_BORDER_OFFSET, -READY_BORDER_OFFSET)
+    bottom:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", READY_BORDER_INSET, READY_BORDER_INSET)
+    bottom:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -READY_BORDER_INSET, READY_BORDER_INSET)
     bottom:SetHeight(READY_BORDER_THICKNESS)
     border.edges[#border.edges + 1] = bottom
 
@@ -582,6 +590,11 @@ local function SetReadyBorderAlpha(border, alpha)
             edge:Hide()
         end
     end
+end
+
+local function GetReadyBorderAlpha(now)
+    local pulse = math.abs(math.sin((now or GetTime()) * READY_BORDER_PULSE_SPEED))
+    return READY_BORDER_BASE_ALPHA + (READY_BORDER_PULSE_ALPHA * pulse)
 end
 
 local function GetPlayerSpecID()
@@ -1598,11 +1611,10 @@ local function UpdateCountOverlay(spellID, estimated, mode, now)
     end
 
     if mode == "ready" then
-        local pulse = 0.70 + (0.30 * math.abs(math.sin((now or GetTime()) * 5.5)))
         if countText then
             countText:SetTextColor(0.92, 1.00, 0.95)
         end
-        SetReadyBorderAlpha(border, 0.75 + (0.25 * pulse))
+        SetReadyBorderAlpha(border, GetReadyBorderAlpha(now))
     elseif mode == "building" then
         if countText then
             countText:SetTextColor(1.00, 0.88, 0.56)
@@ -1663,8 +1675,7 @@ local function UpdateTrackedReadyOverlay(spellID, now)
 
     local border = overlay.Border
     if IsEstimatedTrackedCooldownReady(spellID, now) then
-        local pulse = 0.70 + (0.30 * math.abs(math.sin((now or GetTime()) * 5.5)))
-        SetReadyBorderAlpha(border, 0.75 + (0.25 * pulse))
+        SetReadyBorderAlpha(border, GetReadyBorderAlpha(now))
     else
         SetReadyBorderAlpha(border, 0)
     end
@@ -1757,6 +1768,8 @@ local function ResetTrackerState(clearGroups)
     end
 
     wipe(pendingHoG)
+    wipe(completedWildImpSummonCasts)
+    wipe(completedWildImpSummonCastOrder)
     wipe(pendingHardcastDemonbolts)
     nextInnerDemonAt = nil
     ResetEstimatedCooldowns()
@@ -1996,6 +2009,28 @@ local function HandlePowerSiphonCast(now)
     StartEstimatedTrackedCooldown(POWER_SIPHON_SPELL_ID, now)
 end
 
+local function HandleWildImpSummonCast(count, source, now)
+    AddGroup(count or MAX_HAND_OF_GULDAN_IMPS, source, now)
+    if IsTyrantWindowActive(now) then
+        tyrantHoGCount = (tyrantHoGCount or 0) + 1
+    end
+end
+
+local function RememberCompletedWildImpSummonCast(castGUID)
+    if not castGUID or completedWildImpSummonCasts[castGUID] then
+        return
+    end
+
+    completedWildImpSummonCasts[castGUID] = true
+    table.insert(completedWildImpSummonCastOrder, castGUID)
+    while #completedWildImpSummonCastOrder > COMPLETED_WILD_IMP_CAST_CACHE_LIMIT do
+        local oldCastGUID = table.remove(completedWildImpSummonCastOrder, 1)
+        if oldCastGUID then
+            completedWildImpSummonCasts[oldCastGUID] = nil
+        end
+    end
+end
+
 -- Blizzard owns layout. Rebuild cached frame links after it moves things.
 local function HookCooldownViewer()
     if not EssentialCooldownViewer or EssentialCooldownViewer.ImpTrackerHooked or not EssentialCooldownViewer.GetItemFrames then
@@ -2093,8 +2128,8 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
             return
         end
 
-        if spellID == HAND_OF_GULDAN_SPELL_ID and castGUID then
-            pendingHoG[castGUID] = MAX_HAND_OF_GULDAN_IMPS
+        if castGUID and (spellID == HAND_OF_GULDAN_SPELL_ID or spellID == RUINATION_SPELL_ID) then
+            pendingHoG[castGUID] = spellID == RUINATION_SPELL_ID and RUINATION_WILD_IMPS or MAX_HAND_OF_GULDAN_IMPS
         elseif spellID == DEMONBOLT_SPELL_ID and castGUID then
             pendingHardcastDemonbolts[castGUID] = true
         end
@@ -2134,12 +2169,20 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
             end
         end
 
-        if spellID == HAND_OF_GULDAN_SPELL_ID then
-            local count = pendingHoG[castGUID]
-            pendingHoG[castGUID] = nil
-            AddGroup(count or MAX_HAND_OF_GULDAN_IMPS, "hand-of-guldan", now)
-            if IsTyrantWindowActive(now) then
-                tyrantHoGCount = (tyrantHoGCount or 0) + 1
+        if spellID == HAND_OF_GULDAN_SPELL_ID or spellID == RUINATION_SPELL_ID then
+            if castGUID and completedWildImpSummonCasts[castGUID] then
+                pendingHoG[castGUID] = nil
+            else
+                local count = castGUID and pendingHoG[castGUID]
+                if castGUID then
+                    pendingHoG[castGUID] = nil
+                    RememberCompletedWildImpSummonCast(castGUID)
+                end
+                if spellID == RUINATION_SPELL_ID then
+                    HandleWildImpSummonCast(count or RUINATION_WILD_IMPS, "ruination", now)
+                else
+                    HandleWildImpSummonCast(count or MAX_HAND_OF_GULDAN_IMPS, "hand-of-guldan", now)
+                end
             end
         elseif normalizedSpellID == IMPLOSION_SPELL_ID then
             HandleImplosionCast(now)
@@ -2159,6 +2202,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         castGUID = NormalizeSafeStringKey(castGUID)
         if unit == "player" and castGUID then
             pendingHoG[castGUID] = nil
+            completedWildImpSummonCasts[castGUID] = nil
             pendingHardcastDemonbolts[castGUID] = nil
         end
         UpdateDisplay()
