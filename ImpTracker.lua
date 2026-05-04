@@ -77,12 +77,26 @@ local IMPLOSION_DEBUG_COUNT_SHADOW_COLOR = { 0, 0, 0, 1.00 }
 local IMPLOSION_DEBUG_COUNT_SHADOW_OFFSET = { 1, -1 }
 -- Keep this plain; tooltip border art sits badly against Blizzard's masked icons.
 local READY_BORDER_TEXTURE = "Interface\\Buttons\\WHITE8X8"
-local READY_BORDER_COLOR = { 0.32, 1.00, 0.52 }
+local READY_BORDER_COLOR = { 0.18, 1.00, 0.36 }
 local READY_BORDER_INSET = 1
-local READY_BORDER_THICKNESS = 1
-local READY_BORDER_BASE_ALPHA = 0.38
-local READY_BORDER_PULSE_ALPHA = 0.18
+local READY_BORDER_THICKNESS = 2
+local READY_BORDER_BASE_ALPHA = 0.68
+local READY_BORDER_PULSE_ALPHA = 0.22
 local READY_BORDER_PULSE_SPEED = 4.25
+local Advisor = {
+    borderColors = {
+        ready = READY_BORDER_COLOR,
+    },
+    textColors = {
+        ready = { 0.92, 1.00, 0.95 },
+        tracking = { 0.84, 0.96, 1.00 },
+        offspec = { 0.55, 0.55, 0.60 },
+    },
+    impExpiringSoonSeconds = 3,
+    impAgingSoonSeconds = 6,
+    tyrantSetupSoonSeconds = 8,
+    doomguardSoonSeconds = 8,
+}
 
 -- First-load fallbacks. Learned names are cached once the client exposes them.
 local FALLBACK_NAMES = {
@@ -413,13 +427,15 @@ local function RememberChargeCountStyle(chargeCount)
     local pointCount = textRegion.GetNumPoints and textRegion:GetNumPoints() or 0
     for i = 1, pointCount do
         local point, relativeTo, relativePoint, xOfs, yOfs = textRegion:GetPoint(i)
-        points[i] = {
-            point = point,
-            relativeTo = relativeTo,
-            relativePoint = relativePoint,
-            xOfs = xOfs,
-            yOfs = yOfs,
-        }
+        if type(point) == "string" then
+            points[#points + 1] = {
+                point = point,
+                relativeTo = relativeTo,
+                relativePoint = type(relativePoint) == "string" and relativePoint or point,
+                xOfs = type(xOfs) == "number" and xOfs or 0,
+                yOfs = type(yOfs) == "number" and yOfs or 0,
+            }
+        end
     end
 
     chargeCount.ImpTrackerChargeCountStyle = {
@@ -471,9 +487,17 @@ local function RestoreChargeCountStyle(chargeCount)
         textRegion:SetShadowOffset(unpack(style.shadowOffset))
     end
 
+    local restoredPoint = false
     textRegion:ClearAllPoints()
     for _, pointInfo in ipairs(style.points or {}) do
-        textRegion:SetPoint(pointInfo.point, pointInfo.relativeTo, pointInfo.relativePoint, pointInfo.xOfs, pointInfo.yOfs)
+        if type(pointInfo.point) == "string" then
+            local ok = pcall(textRegion.SetPoint, textRegion, pointInfo.point, pointInfo.relativeTo, pointInfo.relativePoint or pointInfo.point, pointInfo.xOfs or 0, pointInfo.yOfs or 0)
+            restoredPoint = restoredPoint or ok
+        end
+    end
+
+    if not restoredPoint then
+        textRegion:SetPoint("CENTER", chargeCount, "CENTER", 0, 0)
     end
 end
 
@@ -495,13 +519,11 @@ local function SetImplosionChargeCountStyle(itemFrame, enabled, mode, force)
     if enabled then
         local style = chargeCount.ImpTrackerChargeCountStyle or {}
         local fontPath = IMPLOSION_NATIVE_COUNT_FONT_PATH or style.fontPath or "Fonts\\FRIZQT__.TTF"
-        local fallbackFontPath = style.fontPath or "Fonts\\FRIZQT__.TTF"
         local fontSize = IMPLOSION_NATIVE_COUNT_FONT_SIZE
         local anchor = itemFrame.Icon or itemFrame
 
-        if not textRegion:SetFont(fontPath, fontSize, IMPLOSION_NATIVE_COUNT_FONT_FLAGS) then
-            textRegion:SetFont(fallbackFontPath, fontSize, IMPLOSION_NATIVE_COUNT_FONT_FLAGS)
-        end
+        -- Midnight can return a secret boolean here; never branch on it.
+        textRegion:SetFont(fontPath, fontSize, IMPLOSION_NATIVE_COUNT_FONT_FLAGS)
         textRegion:SetJustifyH("RIGHT")
         textRegion:SetJustifyV("BOTTOM")
         textRegion:ClearAllPoints()
@@ -592,9 +614,48 @@ local function SetReadyBorderAlpha(border, alpha)
     end
 end
 
+function Advisor.SetReadyBorderColor(border, color)
+    if not border or not color then
+        return
+    end
+
+    if border.ImpTrackerColor == color then
+        return
+    end
+
+    border.ImpTrackerColor = color
+    for _, edge in ipairs(border.edges or {}) do
+        if edge.SetColorTexture then
+            edge:SetColorTexture(color[1], color[2], color[3], 1)
+        else
+            edge:SetTexture(READY_BORDER_TEXTURE)
+            edge:SetVertexColor(color[1], color[2], color[3], 1)
+        end
+    end
+end
+
 local function GetReadyBorderAlpha(now)
     local pulse = math.abs(math.sin((now or GetTime()) * READY_BORDER_PULSE_SPEED))
     return READY_BORDER_BASE_ALPHA + (READY_BORDER_PULSE_ALPHA * pulse)
+end
+
+function Advisor.SetReadyBorderMode(border, mode, now)
+    local color = Advisor.borderColors[mode]
+    if not color then
+        SetReadyBorderAlpha(border, 0)
+        return
+    end
+
+    Advisor.SetReadyBorderColor(border, color)
+    SetReadyBorderAlpha(border, GetReadyBorderAlpha(now))
+end
+
+function Advisor.GetTextColor(mode)
+    if mode == "ready" or mode == "offspec" then
+        return Advisor.textColors[mode]
+    end
+
+    return Advisor.textColors.tracking
 end
 
 local function GetPlayerSpecID()
@@ -1131,6 +1192,145 @@ local function GetEstimatedImpCount(now)
     return total
 end
 
+function Advisor.GetImpPressure(now)
+    now = now or GetTime()
+    local decayPerSecond = math.max(0.1, GetImpEnergyDecayPerSecond())
+    local pressure = {
+        expiring = 0,
+        aging = 0,
+        fresh = 0,
+    }
+
+    for i = 1, #activeGroups do
+        local group = activeGroups[i]
+        local count = group and math.max(0, tonumber(group.count) or 0) or 0
+        if count > 0 then
+            local energyStartAt = group.energyStartAt or group.spawn or now
+            if now < energyStartAt then
+                pressure.fresh = pressure.fresh + count
+            else
+                local timeLeft = ((group.energy or IMP_START_ENERGY) / decayPerSecond)
+                if timeLeft <= Advisor.impExpiringSoonSeconds then
+                    pressure.expiring = pressure.expiring + count
+                elseif timeLeft <= Advisor.impAgingSoonSeconds then
+                    pressure.aging = pressure.aging + count
+                end
+            end
+        end
+    end
+
+    return pressure
+end
+
+function Advisor.IsCooldownReady(remaining)
+    return remaining ~= nil and remaining <= 0
+end
+
+function Advisor.IsCooldownSoon(remaining, seconds)
+    return remaining ~= nil and remaining > 0 and remaining <= seconds
+end
+
+function Advisor.GetState(estimated, threshold, now)
+    now = now or GetTime()
+    estimated = math.max(0, tonumber(estimated) or 0)
+    threshold = math.max(1, tonumber(threshold) or defaults.implosionThreshold)
+
+    local implosionRemaining = GetEstimatedImplosionRemaining(now)
+    local powerSiphonRemaining = GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now)
+    local dreadstalkerRemaining = GetEstimatedTrackedCooldownRemaining(CALL_DREADSTALKERS_SPELL_ID, now)
+    local grimoireRemaining = GetEstimatedTrackedCooldownRemaining(GRIMOIRE_SLOT_TRACKING_KEY, now)
+    local tyrantRemaining = GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now)
+    local doomguardSpellID = GetDoomguardSpellID()
+    local doomguardRemaining = doomguardSpellID and GetEstimatedTrackedCooldownRemaining(doomguardSpellID, now) or nil
+    local impPressure = Advisor.GetImpPressure(now)
+
+    local state = {
+        estimated = estimated,
+        threshold = threshold,
+        impPressure = impPressure,
+        tyrantActive = IsTyrantWindowActive(now),
+        tyrantReady = Advisor.IsCooldownReady(tyrantRemaining),
+        tyrantSoon = Advisor.IsCooldownReady(tyrantRemaining) or Advisor.IsCooldownSoon(tyrantRemaining, Advisor.tyrantSetupSoonSeconds),
+        dreadstalkersReady = Advisor.IsCooldownReady(dreadstalkerRemaining),
+        grimoireReady = Advisor.IsCooldownReady(grimoireRemaining),
+        doomguardReady = Advisor.IsCooldownReady(doomguardRemaining),
+        doomguardSoon = Advisor.IsCooldownSoon(doomguardRemaining, Advisor.doomguardSoonSeconds),
+        modes = {},
+    }
+
+    local enoughForImplosion = estimated >= threshold
+    if enoughForImplosion and implosionRemaining <= 0 then
+        if HasToHellAndBack() then
+            state.modes[IMPLOSION_SPELL_ID] = "ready"
+        elseif state.tyrantActive then
+            state.modes[IMPLOSION_SPELL_ID] = "hold"
+        elseif state.tyrantSoon and impPressure.expiring < 2 and estimated < (threshold + 2) then
+            state.modes[IMPLOSION_SPELL_ID] = "hold"
+        else
+            state.modes[IMPLOSION_SPELL_ID] = "ready"
+        end
+    elseif enoughForImplosion then
+        state.modes[IMPLOSION_SPELL_ID] = "building"
+    elseif estimated > 0 then
+        state.modes[IMPLOSION_SPELL_ID] = "building"
+    else
+        state.modes[IMPLOSION_SPELL_ID] = "tracking"
+    end
+
+    local enoughForSiphon = estimated >= IMPS_REMOVED_PER_POWER_SIPHON
+    if powerSiphonRemaining ~= nil and powerSiphonRemaining > 0 then
+        state.modes[POWER_SIPHON_SPELL_ID] = enoughForSiphon and "building" or "tracking"
+    elseif enoughForSiphon then
+        if state.tyrantActive or (state.tyrantSoon and impPressure.expiring < IMPS_REMOVED_PER_POWER_SIPHON) then
+            state.modes[POWER_SIPHON_SPELL_ID] = "hold"
+        elseif state.doomguardSoon or estimated >= 4 or impPressure.expiring >= IMPS_REMOVED_PER_POWER_SIPHON then
+            state.modes[POWER_SIPHON_SPELL_ID] = "ready"
+        else
+            state.modes[POWER_SIPHON_SPELL_ID] = "building"
+        end
+    else
+        state.modes[POWER_SIPHON_SPELL_ID] = estimated > 0 and "building" or "tracking"
+    end
+
+    if state.dreadstalkersReady then
+        state.modes[CALL_DREADSTALKERS_SPELL_ID] = state.tyrantSoon and "setup" or "ready"
+    else
+        state.modes[CALL_DREADSTALKERS_SPELL_ID] = "tracking"
+    end
+
+    if state.grimoireReady then
+        state.modes[GRIMOIRE_SLOT_TRACKING_KEY] = state.tyrantSoon and "setup" or "ready"
+    else
+        state.modes[GRIMOIRE_SLOT_TRACKING_KEY] = "tracking"
+    end
+
+    if state.tyrantActive then
+        state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "tracking"
+    elseif state.tyrantReady then
+        if state.dreadstalkersReady or state.grimoireReady or estimated < threshold then
+            state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "hold"
+        else
+            state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "ready"
+        end
+    elseif Advisor.IsCooldownSoon(tyrantRemaining, Advisor.tyrantSetupSoonSeconds) then
+        state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "setup"
+    else
+        state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "tracking"
+    end
+
+    if doomguardSpellID then
+        if state.doomguardReady then
+            state.modes[doomguardSpellID] = "ready"
+        elseif state.doomguardSoon then
+            state.modes[doomguardSpellID] = "setup"
+        else
+            state.modes[doomguardSpellID] = "tracking"
+        end
+    end
+
+    return state
+end
+
 local function BuildRemovalOrder()
     local indices = {}
     for i = 1, #activeGroups do
@@ -1318,15 +1518,18 @@ local function PrintStatus(now)
     now = now or GetTime()
     local estimated = GetEstimatedImpCount(now)
     local auraCount, _, auraSpellID = GetWildImpAuraSnapshot()
+    local threshold = db.implosionThreshold or defaults.implosionThreshold
+    local adviceState = Advisor.GetState(estimated, threshold, now)
 
     print(string.format("|cff9d7dffImpTracker:|r Estimated imps = %d", estimated))
     print(string.format("|cff9d7dffImpTracker:|r Active groups = %d", #activeGroups))
     print(string.format("|cff9d7dffImpTracker:|r Spec = %s", IsDemonologySpecActive() and "Demonology" or "Other"))
     print(string.format("|cff9d7dffImpTracker:|r Inner Demons = %s | To Hell and Back = %s | Reign of Tyranny = %s", talentState.innerDemons and "on" or "off", talentState.toHellAndBack and "on" or "off", talentState.reignOfTyranny and "on" or "off"))
     print(string.format("|cff9d7dffImpTracker:|r Spiteful Reconstitution = %s | Random Wild Imp proc not estimated", talentState.spitefulReconstitution and "on" or "off"))
-    print(string.format("|cff9d7dffImpTracker:|r Implosion threshold = %s | Implosion CD = %ss | Ready in %.1fs", tostring(db.implosionThreshold or defaults.implosionThreshold), tostring(db.implosionCooldown or defaults.implosionCooldown), GetEstimatedImplosionRemaining(now)))
+    print(string.format("|cff9d7dffImpTracker:|r Implosion threshold = %s | Implosion CD = %ss | Ready in %.1fs", tostring(threshold), tostring(db.implosionCooldown or defaults.implosionCooldown), GetEstimatedImplosionRemaining(now)))
     print(string.format("|cff9d7dffImpTracker:|r Power Siphon ready in %.1fs | Dreadstalkers ready in %.1fs | Grimoire ready in %.1fs | Tyrant ready in %.1fs", GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(CALL_DREADSTALKERS_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(GRIMOIRE_SLOT_TRACKING_KEY, now) or 0, GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now) or 0))
     print(string.format("|cff9d7dffImpTracker:|r Tyrant window = %s | HoG during Tyrant = %d | Ends in %.1fs", IsTyrantWindowActive(now) and "active" or "idle", tyrantHoGCount or 0, math.max(0, (tyrantWindowUntil or 0) - now)))
+    print(string.format("|cff9d7dffImpTracker:|r Advice = Implosion:%s | Power Siphon:%s | Dogs:%s | Grimoire:%s | Tyrant:%s", tostring(adviceState.modes[IMPLOSION_SPELL_ID]), tostring(adviceState.modes[POWER_SIPHON_SPELL_ID]), tostring(adviceState.modes[CALL_DREADSTALKERS_SPELL_ID]), tostring(adviceState.modes[GRIMOIRE_SLOT_TRACKING_KEY]), tostring(adviceState.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID])))
 
     local doomguardSpellID = GetDoomguardSpellID()
     if doomguardSpellID then
@@ -1610,27 +1813,11 @@ local function UpdateCountOverlay(spellID, estimated, mode, now)
         end
     end
 
-    if mode == "ready" then
-        if countText then
-            countText:SetTextColor(0.92, 1.00, 0.95)
-        end
-        SetReadyBorderAlpha(border, GetReadyBorderAlpha(now))
-    elseif mode == "building" then
-        if countText then
-            countText:SetTextColor(1.00, 0.88, 0.56)
-        end
-        SetReadyBorderAlpha(border, 0)
-    elseif mode == "offspec" then
-        if countText then
-            countText:SetTextColor(0.55, 0.55, 0.60)
-        end
-        SetReadyBorderAlpha(border, 0)
-    else
-        if countText then
-            countText:SetTextColor(0.84, 0.96, 1.00)
-        end
-        SetReadyBorderAlpha(border, 0)
+    if countText then
+        countText:SetTextColor(unpack(Advisor.GetTextColor(mode)))
     end
+
+    Advisor.SetReadyBorderMode(border, mode, now)
 end
 
 local function UpdateImplosionOverlay(estimated, mode, now)
@@ -1641,7 +1828,7 @@ local function UpdatePowerSiphonOverlay(estimated, mode, now)
     UpdateCountOverlay(POWER_SIPHON_SPELL_ID, estimated, mode, now)
 end
 
-local function UpdateTrackedReadyOverlay(spellID, now)
+local function UpdateTrackedReadyOverlay(spellID, now, adviceState)
     if not IsOverlayEnabled(spellID) then
         local itemFrame = GetTrackedItemFrame(spellID)
         if itemFrame then
@@ -1674,11 +1861,12 @@ local function UpdateTrackedReadyOverlay(spellID, now)
     overlay:Show()
 
     local border = overlay.Border
-    if IsEstimatedTrackedCooldownReady(spellID, now) then
-        SetReadyBorderAlpha(border, GetReadyBorderAlpha(now))
-    else
-        SetReadyBorderAlpha(border, 0)
+    local mode = adviceState and adviceState.modes and adviceState.modes[spellID]
+    if not mode then
+        mode = IsEstimatedTrackedCooldownReady(spellID, now) and "ready" or "tracking"
     end
+
+    Advisor.SetReadyBorderMode(border, mode, now)
 end
 
 local function UpdateTyrantWindowOverlay(now)
@@ -1710,43 +1898,6 @@ local function UpdateTyrantWindowOverlay(now)
     hogIcon:Show()
 end
 
-local function GetStatusDetail(estimated, threshold, remaining)
-    if estimated >= threshold and remaining <= 0 then
-        return "IMPLOSION READY", "ready"
-    end
-
-    if estimated >= threshold and remaining > 0 then
-        return string.format("CD %.1fs", remaining), "building"
-    end
-
-    local missing = math.max(0, threshold - estimated)
-    if remaining > 0 and estimated > 0 then
-        return string.format("Need %d | CD %.1fs", missing, remaining), "tracking"
-    end
-
-    if missing > 0 then
-        return string.format("Need %d more", missing), "tracking"
-    end
-
-    return "Tracking", "tracking"
-end
-
-local function GetPowerSiphonMode(estimated, remaining)
-    if estimated >= IMPS_REMOVED_PER_POWER_SIPHON and remaining <= 0 then
-        return "ready"
-    end
-
-    if remaining > 0 then
-        return estimated >= IMPS_REMOVED_PER_POWER_SIPHON and "building" or "tracking"
-    end
-
-    if estimated > 0 then
-        return "building"
-    end
-
-    return "tracking"
-end
-
 local function EnsureAllTrackedOverlays()
     EnsureTrackedOverlay(IMPLOSION_SPELL_ID)
     EnsureTrackedOverlay(POWER_SIPHON_SPELL_ID)
@@ -1756,9 +1907,9 @@ local function EnsureAllTrackedOverlays()
     end
 end
 
-local function UpdateAllReadyOverlays(now)
+local function UpdateAllReadyOverlays(now, adviceState)
     for _, spellID in ipairs(GetTrackedReadySpellIDs()) do
-        UpdateTrackedReadyOverlay(spellID, now)
+        UpdateTrackedReadyOverlay(spellID, now, adviceState)
     end
 end
 
@@ -1819,14 +1970,11 @@ local function UpdateDisplay(forceStructuralCleanup)
 
     local estimated = GetEstimatedImpCount(now)
     local threshold = db.implosionThreshold or defaults.implosionThreshold
-    local remaining = GetEstimatedImplosionRemaining(now)
-    local _, mode = GetStatusDetail(estimated, threshold, remaining)
-    local powerSiphonRemaining = GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now) or 0
-    local powerSiphonMode = GetPowerSiphonMode(estimated, powerSiphonRemaining)
+    local adviceState = Advisor.GetState(estimated, threshold, now)
 
-    UpdateImplosionOverlay(estimated, mode == "tracking" and (estimated > 0 and "building" or "tracking") or mode, now)
-    UpdatePowerSiphonOverlay(estimated, powerSiphonMode, now)
-    UpdateAllReadyOverlays(now)
+    UpdateImplosionOverlay(estimated, adviceState.modes[IMPLOSION_SPELL_ID], now)
+    UpdatePowerSiphonOverlay(estimated, adviceState.modes[POWER_SIPHON_SPELL_ID], now)
+    UpdateAllReadyOverlays(now, adviceState)
     UpdateTyrantWindowOverlay(now)
 end
 
