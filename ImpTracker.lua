@@ -43,6 +43,7 @@ local SUMMON_DEMONIC_TYRANT_CAST_SPELL_ID = 334585
 local DEMONBOLT_SPELL_ID = 264178
 local RUINATION_SPELL_ID = 434635
 local DEMONOLOGY_SPEC_ID = 266
+local SOUL_SHARDS_POWER_TYPE = 7
 
 local MAX_HAND_OF_GULDAN_IMPS = 3
 local RUINATION_WILD_IMPS = 3
@@ -50,6 +51,7 @@ local IMPS_REMOVED_PER_IMPLOSION = 6
 local IMPS_REMOVED_PER_POWER_SIPHON = 2
 local TO_HELL_AND_BACK_IMPS_PER_BATCH = 1
 local TO_HELL_AND_BACK_SACRIFICE_BATCH_SIZE = 2
+local ADVISOR_GCD_MAX_SECONDS = 1.5
 local DOOMGUARD_DEMONIC_CORE_CDR = 3
 local TYRANT_BASE_WINDOW_DURATION = 15
 local TYRANT_REIGN_BONUS_DURATION = 5
@@ -95,6 +97,8 @@ local Advisor = {
     impExpiringSoonSeconds = 3,
     impAgingSoonSeconds = 6,
     tyrantSetupSoonSeconds = 8,
+    tyrantDreadstalkersCloseSeconds = 12 - ADVISOR_GCD_MAX_SECONDS,
+    tyrantDreadstalkersFarSeconds = 20 + ADVISOR_GCD_MAX_SECONDS,
     doomguardSoonSeconds = 8,
 }
 
@@ -113,6 +117,8 @@ local FALLBACK_NAMES = {
     spellLock = "Spell Lock",
     devourMagic = "Devour Magic",
     reignOfTyranny = "Reign of Tyranny",
+    diabolicRitual = "Diabolic Ritual",
+    demonicSoul = "Demonic Soul",
     powerSiphon = "Power Siphon",
     summonDoomguard = "Summon Doomguard",
 }
@@ -154,6 +160,8 @@ local talentState = {
     toHellAndBack = false,
     spitefulReconstitution = false,
     reignOfTyranny = false,
+    diabolicRitual = false,
+    demonicSoul = false,
 }
 
 local nextInnerDemonAt
@@ -309,6 +317,8 @@ RebuildLocalizedNameCaches = function()
     localizedNames.singeMagic = GetLearnedName("singeMagic")
     localizedNames.spellLock = GetLearnedName("spellLock")
     localizedNames.devourMagic = GetLearnedName("devourMagic")
+    localizedNames.diabolicRitual = GetLearnedName("diabolicRitual")
+    localizedNames.demonicSoul = GetLearnedName("demonicSoul")
     localizedNames.powerSiphon = GetSpellNameByID(POWER_SIPHON_SPELL_ID) or GetLearnedName("powerSiphon")
     localizedNames.summonDoomguard = GetLearnedName("summonDoomguard")
 
@@ -853,6 +863,8 @@ local function RefreshTalentState()
     talentState.toHellAndBack = false
     talentState.spitefulReconstitution = false
     talentState.reignOfTyranny = false
+    talentState.diabolicRitual = false
+    talentState.demonicSoul = false
 
     RefreshSpecState()
 
@@ -914,6 +926,12 @@ local function RefreshTalentState()
                         elseif spellName and (spellName == localizedNames.reignOfTyranny or spellName == FALLBACK_NAMES.reignOfTyranny) then
                             talentState.reignOfTyranny = true
                             RememberName("reignOfTyranny", spellName)
+                        elseif spellName and (spellName == localizedNames.diabolicRitual or spellName == FALLBACK_NAMES.diabolicRitual) then
+                            talentState.diabolicRitual = true
+                            RememberName("diabolicRitual", spellName)
+                        elseif spellName and (spellName == localizedNames.demonicSoul or spellName == FALLBACK_NAMES.demonicSoul) then
+                            talentState.demonicSoul = true
+                            RememberName("demonicSoul", spellName)
                         elseif spellName and (spellName == localizedNames.powerSiphon or spellName == FALLBACK_NAMES.powerSiphon) then
                             RememberName("powerSiphon", spellName)
                             RememberSpellID("powerSiphon", spellID)
@@ -949,6 +967,40 @@ end
 
 local function HasReignOfTyranny()
     return IsDemonologySpecActive() and talentState.reignOfTyranny
+end
+
+local function HasDiabolicRitual()
+    return IsDemonologySpecActive() and talentState.diabolicRitual
+end
+
+local function HasDemonicSoul()
+    return IsDemonologySpecActive() and talentState.demonicSoul
+end
+
+local function GetSoulShardsPowerType()
+    if Enum and Enum.PowerType and Enum.PowerType.SoulShards then
+        return Enum.PowerType.SoulShards
+    end
+
+    return SOUL_SHARDS_POWER_TYPE
+end
+
+local function GetPlayerSoulShards()
+    if not UnitPower or not IsDemonologySpecActive() then
+        return nil
+    end
+
+    local ok, rawShards = pcall(UnitPower, "player", GetSoulShardsPowerType())
+    if not ok then
+        return nil
+    end
+
+    local shards = NormalizeSafeNumber(rawShards)
+    if shards == nil then
+        return nil
+    end
+
+    return math.max(0, math.min(5, math.floor(shards + 0.5)))
 end
 
 local function NormalizeTrackedCastSpellID(spellID)
@@ -1243,11 +1295,14 @@ function Advisor.GetState(estimated, threshold, now)
     local doomguardSpellID = GetDoomguardSpellID()
     local doomguardRemaining = doomguardSpellID and GetEstimatedTrackedCooldownRemaining(doomguardSpellID, now) or nil
     local impPressure = Advisor.GetImpPressure(now)
+    local soulShards = GetPlayerSoulShards()
 
     local state = {
         estimated = estimated,
         threshold = threshold,
         impPressure = impPressure,
+        soulShards = soulShards,
+        hasMaxSoulShards = soulShards ~= nil and soulShards >= 5,
         tyrantActive = IsTyrantWindowActive(now),
         tyrantReady = Advisor.IsCooldownReady(tyrantRemaining),
         tyrantSoon = Advisor.IsCooldownReady(tyrantRemaining) or Advisor.IsCooldownSoon(tyrantRemaining, Advisor.tyrantSetupSoonSeconds),
@@ -1293,13 +1348,20 @@ function Advisor.GetState(estimated, threshold, now)
     end
 
     if state.dreadstalkersReady then
-        state.modes[CALL_DREADSTALKERS_SPELL_ID] = state.tyrantSoon and "setup" or "ready"
+        local useReignWindow = HasReignOfTyranny() and not HasDemonicSoul()
+        local tyrantClose = Advisor.IsCooldownReady(tyrantRemaining) or Advisor.IsCooldownSoon(tyrantRemaining, Advisor.tyrantDreadstalkersCloseSeconds)
+        local tyrantFar = tyrantRemaining == nil or tyrantRemaining >= Advisor.tyrantDreadstalkersFarSeconds
+        if useReignWindow and not (tyrantClose or tyrantFar) then
+            state.modes[CALL_DREADSTALKERS_SPELL_ID] = "setup"
+        else
+            state.modes[CALL_DREADSTALKERS_SPELL_ID] = "ready"
+        end
     else
         state.modes[CALL_DREADSTALKERS_SPELL_ID] = "tracking"
     end
 
     if state.grimoireReady then
-        state.modes[GRIMOIRE_SLOT_TRACKING_KEY] = state.tyrantSoon and "setup" or "ready"
+        state.modes[GRIMOIRE_SLOT_TRACKING_KEY] = "ready"
     else
         state.modes[GRIMOIRE_SLOT_TRACKING_KEY] = "tracking"
     end
@@ -1307,7 +1369,14 @@ function Advisor.GetState(estimated, threshold, now)
     if state.tyrantActive then
         state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "tracking"
     elseif state.tyrantReady then
-        if state.dreadstalkersReady or state.grimoireReady or estimated < threshold then
+        local waitingForSetup = state.dreadstalkersReady or state.grimoireReady or state.doomguardReady
+        if waitingForSetup then
+            state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "hold"
+        elseif HasDiabolicRitual() and not HasDemonicSoul() and soulShards ~= nil and not state.hasMaxSoulShards then
+            state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "hold"
+        elseif HasDiabolicRitual() and not HasDemonicSoul() and soulShards == nil and estimated < threshold then
+            state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "hold"
+        elseif not HasDemonicSoul() and not HasDiabolicRitual() and estimated < threshold then
             state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "hold"
         else
             state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "ready"
@@ -1525,6 +1594,7 @@ local function PrintStatus(now)
     print(string.format("|cff9d7dffImpTracker:|r Active groups = %d", #activeGroups))
     print(string.format("|cff9d7dffImpTracker:|r Spec = %s", IsDemonologySpecActive() and "Demonology" or "Other"))
     print(string.format("|cff9d7dffImpTracker:|r Inner Demons = %s | To Hell and Back = %s | Reign of Tyranny = %s", talentState.innerDemons and "on" or "off", talentState.toHellAndBack and "on" or "off", talentState.reignOfTyranny and "on" or "off"))
+    print(string.format("|cff9d7dffImpTracker:|r Diabolic Ritual = %s | Demonic Soul = %s | Soul Shards = %s", talentState.diabolicRitual and "on" or "off", talentState.demonicSoul and "on" or "off", adviceState.soulShards ~= nil and tostring(adviceState.soulShards) or "unknown"))
     print(string.format("|cff9d7dffImpTracker:|r Spiteful Reconstitution = %s | Random Wild Imp proc not estimated", talentState.spitefulReconstitution and "on" or "off"))
     print(string.format("|cff9d7dffImpTracker:|r Implosion threshold = %s | Implosion CD = %ss | Ready in %.1fs", tostring(threshold), tostring(db.implosionCooldown or defaults.implosionCooldown), GetEstimatedImplosionRemaining(now)))
     print(string.format("|cff9d7dffImpTracker:|r Power Siphon ready in %.1fs | Dreadstalkers ready in %.1fs | Grimoire ready in %.1fs | Tyrant ready in %.1fs", GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(CALL_DREADSTALKERS_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(GRIMOIRE_SLOT_TRACKING_KEY, now) or 0, GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now) or 0))
