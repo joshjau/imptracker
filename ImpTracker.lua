@@ -23,6 +23,7 @@ local MAX_AURA_SLOTS = 255
 local HAND_OF_GULDAN_SPELL_ID = 105174
 local IMPLOSION_SPELL_ID = 196277
 local POWER_SIPHON_SPELL_ID = 264130
+local SUMMON_DOOMGUARD_SPELL_ID = 1276672
 local CALL_DREADSTALKERS_SPELL_ID = 104316
 local CALL_DREADSTALKERS_CAST_SPELL_ID = 334727
 local CALL_DREADSTALKERS_REPLACEMENT_SPELL_IDS = {
@@ -92,6 +93,7 @@ local Advisor = {
     textColors = {
         ready = { 0.92, 1.00, 0.95 },
         tracking = { 0.84, 0.96, 1.00 },
+        unknown = { 0.64, 0.68, 0.76 },
         offspec = { 0.55, 0.55, 0.60 },
     },
     impExpiringSoonSeconds = 3,
@@ -162,6 +164,7 @@ local talentState = {
     reignOfTyranny = false,
     diabolicRitual = false,
     demonicSoul = false,
+    summonDoomguard = false,
 }
 
 local nextInnerDemonAt
@@ -232,6 +235,33 @@ local trackedItemSpellAliases = {}
 for _, spellID in ipairs(CALL_DREADSTALKERS_REPLACEMENT_SPELL_IDS) do
     trackedItemSpellAliases[spellID] = CALL_DREADSTALKERS_SPELL_ID
 end
+
+Advisor.talentSpellIDKeys = {
+    [267216] = "innerDemons",
+    [1281511] = "toHellAndBack",
+    [428394] = "spitefulReconstitution",
+    [1276748] = "reignOfTyranny",
+    [428514] = "diabolicRitual",
+    [470479] = "diabolicRitual",
+    [449614] = "demonicSoul",
+    [449801] = "demonicSoul",
+    [449811] = "demonicSoul",
+    [450510] = "demonicSoul",
+    [POWER_SIPHON_SPELL_ID] = "powerSiphon",
+    [334581] = "powerSiphon",
+    [SUMMON_DOOMGUARD_SPELL_ID] = "summonDoomguard",
+}
+
+Advisor.talentNameMatchKeys = {
+    "innerDemons",
+    "toHellAndBack",
+    "spitefulReconstitution",
+    "reignOfTyranny",
+    "diabolicRitual",
+    "demonicSoul",
+    "powerSiphon",
+    "summonDoomguard",
+}
 
 -- Keep saved data boring; patch behavior belongs in the model below.
 local function CopyDefaults(src, dst)
@@ -348,6 +378,10 @@ RebuildLocalizedNameCaches = function()
 end
 
 local function GetDoomguardSpellID()
+    if talentState.summonDoomguard ~= true then
+        return nil
+    end
+
     return GetLearnedSpellID("summonDoomguard")
 end
 
@@ -361,6 +395,7 @@ local function EnsureDoomguardTracking(spellID)
         trackedSpellConfigs[spellID] = {
             cooldownKey = "doomguardCooldown",
             enabledKey = "showDoomguardOverlay",
+            requiresTalentKey = "summonDoomguard",
         }
     end
 
@@ -389,6 +424,10 @@ local function IsOverlayEnabled(spellID)
     local config = trackedSpellConfigs[spellID]
     if not config or not config.enabledKey then
         return true
+    end
+
+    if config.requiresTalentKey and talentState[config.requiresTalentKey] ~= true then
+        return false
     end
 
     if db and db[config.enabledKey] ~= nil then
@@ -661,7 +700,7 @@ function Advisor.SetReadyBorderMode(border, mode, now)
 end
 
 function Advisor.GetTextColor(mode)
-    if mode == "ready" or mode == "offspec" then
+    if mode == "ready" or mode == "unknown" or mode == "offspec" then
         return Advisor.textColors[mode]
     end
 
@@ -856,6 +895,51 @@ GetSpellNameByID = function(spellID)
     return nil
 end
 
+function Advisor.GetTalentKeyBySpellName(spellName)
+    if not spellName then
+        return nil
+    end
+
+    for _, key in ipairs(Advisor.talentNameMatchKeys) do
+        if spellName == localizedNames[key] or spellName == FALLBACK_NAMES[key] then
+            return key
+        end
+    end
+
+    return nil
+end
+
+function Advisor.MarkActiveTalentSpell(key, spellID, spellName)
+    if not key then
+        return false
+    end
+
+    if spellName then
+        RememberName(key, spellName)
+    end
+
+    if key == "powerSiphon" then
+        RememberSpellID("powerSiphon", spellID)
+        if spellID then
+            trackedSpellAliases[spellID] = POWER_SIPHON_SPELL_ID
+        end
+        return true
+    end
+
+    if key == "summonDoomguard" then
+        talentState.summonDoomguard = true
+        EnsureDoomguardTracking(spellID or SUMMON_DOOMGUARD_SPELL_ID)
+        return true
+    end
+
+    if talentState[key] ~= nil then
+        talentState[key] = true
+        return true
+    end
+
+    return false
+end
+
 -- Talent scans are best-effort through normal spellbook surfaces. "Not seen"
 -- means not modeled right now, not proof Blizzard removed the spell.
 local function RefreshTalentState()
@@ -865,6 +949,7 @@ local function RefreshTalentState()
     talentState.reignOfTyranny = false
     talentState.diabolicRitual = false
     talentState.demonicSoul = false
+    talentState.summonDoomguard = false
 
     RefreshSpecState()
 
@@ -913,32 +998,9 @@ local function RefreshTalentState()
                         local definitionInfo = C_Traits.GetDefinitionInfo(definitionID)
                         local spellID = NormalizeSafeSpellID(definitionInfo and (definitionInfo.overrideSpellID or definitionInfo.spellID))
                         local spellName = GetSpellNameByID(spellID)
-
-                        if spellName and (spellName == localizedNames.innerDemons or spellName == FALLBACK_NAMES.innerDemons) then
-                            talentState.innerDemons = true
-                            RememberName("innerDemons", spellName)
-                        elseif spellName and (spellName == localizedNames.toHellAndBack or spellName == FALLBACK_NAMES.toHellAndBack) then
-                            talentState.toHellAndBack = true
-                            RememberName("toHellAndBack", spellName)
-                        elseif spellName and (spellName == localizedNames.spitefulReconstitution or spellName == FALLBACK_NAMES.spitefulReconstitution) then
-                            talentState.spitefulReconstitution = true
-                            RememberName("spitefulReconstitution", spellName)
-                        elseif spellName and (spellName == localizedNames.reignOfTyranny or spellName == FALLBACK_NAMES.reignOfTyranny) then
-                            talentState.reignOfTyranny = true
-                            RememberName("reignOfTyranny", spellName)
-                        elseif spellName and (spellName == localizedNames.diabolicRitual or spellName == FALLBACK_NAMES.diabolicRitual) then
-                            talentState.diabolicRitual = true
-                            RememberName("diabolicRitual", spellName)
-                        elseif spellName and (spellName == localizedNames.demonicSoul or spellName == FALLBACK_NAMES.demonicSoul) then
-                            talentState.demonicSoul = true
-                            RememberName("demonicSoul", spellName)
-                        elseif spellName and (spellName == localizedNames.powerSiphon or spellName == FALLBACK_NAMES.powerSiphon) then
-                            RememberName("powerSiphon", spellName)
-                            RememberSpellID("powerSiphon", spellID)
-                            trackedSpellAliases[spellID] = POWER_SIPHON_SPELL_ID
-                        elseif spellName and (spellName == localizedNames.summonDoomguard or spellName == FALLBACK_NAMES.summonDoomguard) then
-                            EnsureDoomguardTracking(spellID)
-                        end
+                        local talentKey = spellID and Advisor.talentSpellIDKeys[spellID] or nil
+                        talentKey = talentKey or Advisor.GetTalentKeyBySpellName(spellName)
+                        Advisor.MarkActiveTalentSpell(talentKey, spellID, spellName)
                     end
                 end
             end
@@ -1282,6 +1344,10 @@ function Advisor.IsCooldownSoon(remaining, seconds)
     return remaining ~= nil and remaining > 0 and remaining <= seconds
 end
 
+function Advisor.IsCooldownKnown(remaining)
+    return remaining ~= nil
+end
+
 function Advisor.GetState(estimated, threshold, now)
     now = now or GetTime()
     estimated = math.max(0, tonumber(estimated) or 0)
@@ -1294,6 +1360,11 @@ function Advisor.GetState(estimated, threshold, now)
     local tyrantRemaining = GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now)
     local doomguardSpellID = GetDoomguardSpellID()
     local doomguardRemaining = doomguardSpellID and GetEstimatedTrackedCooldownRemaining(doomguardSpellID, now) or nil
+    local powerSiphonKnown = Advisor.IsCooldownKnown(powerSiphonRemaining)
+    local dreadstalkerKnown = Advisor.IsCooldownKnown(dreadstalkerRemaining)
+    local grimoireKnown = Advisor.IsCooldownKnown(grimoireRemaining)
+    local tyrantKnown = Advisor.IsCooldownKnown(tyrantRemaining)
+    local doomguardKnown = doomguardSpellID and Advisor.IsCooldownKnown(doomguardRemaining) or false
     local impPressure = Advisor.GetImpPressure(now)
     local soulShards = GetPlayerSoulShards()
 
@@ -1304,6 +1375,11 @@ function Advisor.GetState(estimated, threshold, now)
         soulShards = soulShards,
         hasMaxSoulShards = soulShards ~= nil and soulShards >= 5,
         tyrantActive = IsTyrantWindowActive(now),
+        powerSiphonKnown = powerSiphonKnown,
+        dreadstalkerKnown = dreadstalkerKnown,
+        grimoireKnown = grimoireKnown,
+        tyrantKnown = tyrantKnown,
+        doomguardKnown = doomguardKnown,
         tyrantReady = Advisor.IsCooldownReady(tyrantRemaining),
         tyrantSoon = Advisor.IsCooldownReady(tyrantRemaining) or Advisor.IsCooldownSoon(tyrantRemaining, Advisor.tyrantSetupSoonSeconds),
         dreadstalkersReady = Advisor.IsCooldownReady(dreadstalkerRemaining),
@@ -1333,7 +1409,9 @@ function Advisor.GetState(estimated, threshold, now)
     end
 
     local enoughForSiphon = estimated >= IMPS_REMOVED_PER_POWER_SIPHON
-    if powerSiphonRemaining ~= nil and powerSiphonRemaining > 0 then
+    if not powerSiphonKnown then
+        state.modes[POWER_SIPHON_SPELL_ID] = "unknown"
+    elseif powerSiphonRemaining > 0 then
         state.modes[POWER_SIPHON_SPELL_ID] = enoughForSiphon and "building" or "tracking"
     elseif enoughForSiphon then
         if state.tyrantActive or (state.tyrantSoon and impPressure.expiring < IMPS_REMOVED_PER_POWER_SIPHON) then
@@ -1347,11 +1425,15 @@ function Advisor.GetState(estimated, threshold, now)
         state.modes[POWER_SIPHON_SPELL_ID] = estimated > 0 and "building" or "tracking"
     end
 
-    if state.dreadstalkersReady then
+    if not dreadstalkerKnown then
+        state.modes[CALL_DREADSTALKERS_SPELL_ID] = "unknown"
+    elseif state.dreadstalkersReady then
         local useReignWindow = HasReignOfTyranny() and not HasDemonicSoul()
         local tyrantClose = Advisor.IsCooldownReady(tyrantRemaining) or Advisor.IsCooldownSoon(tyrantRemaining, Advisor.tyrantDreadstalkersCloseSeconds)
-        local tyrantFar = tyrantRemaining == nil or tyrantRemaining >= Advisor.tyrantDreadstalkersFarSeconds
-        if useReignWindow and not (tyrantClose or tyrantFar) then
+        local tyrantFar = tyrantRemaining ~= nil and tyrantRemaining >= Advisor.tyrantDreadstalkersFarSeconds
+        if useReignWindow and not tyrantKnown then
+            state.modes[CALL_DREADSTALKERS_SPELL_ID] = "unknown"
+        elseif useReignWindow and not (tyrantClose or tyrantFar) then
             state.modes[CALL_DREADSTALKERS_SPELL_ID] = "setup"
         else
             state.modes[CALL_DREADSTALKERS_SPELL_ID] = "ready"
@@ -1360,7 +1442,9 @@ function Advisor.GetState(estimated, threshold, now)
         state.modes[CALL_DREADSTALKERS_SPELL_ID] = "tracking"
     end
 
-    if state.grimoireReady then
+    if not grimoireKnown then
+        state.modes[GRIMOIRE_SLOT_TRACKING_KEY] = "unknown"
+    elseif state.grimoireReady then
         state.modes[GRIMOIRE_SLOT_TRACKING_KEY] = "ready"
     else
         state.modes[GRIMOIRE_SLOT_TRACKING_KEY] = "tracking"
@@ -1368,6 +1452,8 @@ function Advisor.GetState(estimated, threshold, now)
 
     if state.tyrantActive then
         state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "tracking"
+    elseif not tyrantKnown then
+        state.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID] = "unknown"
     elseif state.tyrantReady then
         local waitingForSetup = state.dreadstalkersReady or state.grimoireReady or state.doomguardReady
         if waitingForSetup then
@@ -1388,7 +1474,9 @@ function Advisor.GetState(estimated, threshold, now)
     end
 
     if doomguardSpellID then
-        if state.doomguardReady then
+        if not doomguardKnown then
+            state.modes[doomguardSpellID] = "unknown"
+        elseif state.doomguardReady then
             state.modes[doomguardSpellID] = "ready"
         elseif state.doomguardSoon then
             state.modes[doomguardSpellID] = "setup"
@@ -1583,6 +1671,14 @@ local function GetWildImpAuraSnapshot()
     return 0, nil, nil
 end
 
+function Advisor.FormatCooldownRemaining(remaining)
+    if remaining == nil then
+        return "unknown"
+    end
+
+    return string.format("%.1fs", remaining)
+end
+
 local function PrintStatus(now)
     now = now or GetTime()
     local estimated = GetEstimatedImpCount(now)
@@ -1594,16 +1690,16 @@ local function PrintStatus(now)
     print(string.format("|cff9d7dffImpTracker:|r Active groups = %d", #activeGroups))
     print(string.format("|cff9d7dffImpTracker:|r Spec = %s", IsDemonologySpecActive() and "Demonology" or "Other"))
     print(string.format("|cff9d7dffImpTracker:|r Inner Demons = %s | To Hell and Back = %s | Reign of Tyranny = %s", talentState.innerDemons and "on" or "off", talentState.toHellAndBack and "on" or "off", talentState.reignOfTyranny and "on" or "off"))
-    print(string.format("|cff9d7dffImpTracker:|r Diabolic Ritual = %s | Demonic Soul = %s | Soul Shards = %s", talentState.diabolicRitual and "on" or "off", talentState.demonicSoul and "on" or "off", adviceState.soulShards ~= nil and tostring(adviceState.soulShards) or "unknown"))
+    print(string.format("|cff9d7dffImpTracker:|r Diabolic Ritual = %s | Demonic Soul = %s | Summon Doomguard = %s | Soul Shards = %s", talentState.diabolicRitual and "on" or "off", talentState.demonicSoul and "on" or "off", talentState.summonDoomguard and "on" or "off", adviceState.soulShards ~= nil and tostring(adviceState.soulShards) or "unknown"))
     print(string.format("|cff9d7dffImpTracker:|r Spiteful Reconstitution = %s | Random Wild Imp proc not estimated", talentState.spitefulReconstitution and "on" or "off"))
     print(string.format("|cff9d7dffImpTracker:|r Implosion threshold = %s | Implosion CD = %ss | Ready in %.1fs", tostring(threshold), tostring(db.implosionCooldown or defaults.implosionCooldown), GetEstimatedImplosionRemaining(now)))
-    print(string.format("|cff9d7dffImpTracker:|r Power Siphon ready in %.1fs | Dreadstalkers ready in %.1fs | Grimoire ready in %.1fs | Tyrant ready in %.1fs", GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(CALL_DREADSTALKERS_SPELL_ID, now) or 0, GetEstimatedTrackedCooldownRemaining(GRIMOIRE_SLOT_TRACKING_KEY, now) or 0, GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now) or 0))
+    print(string.format("|cff9d7dffImpTracker:|r Power Siphon ready in %s | Dreadstalkers ready in %s | Grimoire ready in %s | Tyrant ready in %s", Advisor.FormatCooldownRemaining(GetEstimatedTrackedCooldownRemaining(POWER_SIPHON_SPELL_ID, now)), Advisor.FormatCooldownRemaining(GetEstimatedTrackedCooldownRemaining(CALL_DREADSTALKERS_SPELL_ID, now)), Advisor.FormatCooldownRemaining(GetEstimatedTrackedCooldownRemaining(GRIMOIRE_SLOT_TRACKING_KEY, now)), Advisor.FormatCooldownRemaining(GetEstimatedTrackedCooldownRemaining(SUMMON_DEMONIC_TYRANT_SPELL_ID, now))))
     print(string.format("|cff9d7dffImpTracker:|r Tyrant window = %s | HoG during Tyrant = %d | Ends in %.1fs", IsTyrantWindowActive(now) and "active" or "idle", tyrantHoGCount or 0, math.max(0, (tyrantWindowUntil or 0) - now)))
     print(string.format("|cff9d7dffImpTracker:|r Advice = Implosion:%s | Power Siphon:%s | Dogs:%s | Grimoire:%s | Tyrant:%s", tostring(adviceState.modes[IMPLOSION_SPELL_ID]), tostring(adviceState.modes[POWER_SIPHON_SPELL_ID]), tostring(adviceState.modes[CALL_DREADSTALKERS_SPELL_ID]), tostring(adviceState.modes[GRIMOIRE_SLOT_TRACKING_KEY]), tostring(adviceState.modes[SUMMON_DEMONIC_TYRANT_SPELL_ID])))
 
     local doomguardSpellID = GetDoomguardSpellID()
     if doomguardSpellID then
-        print(string.format("|cff9d7dffImpTracker:|r Doomguard spellID=%s | Ready in %.1fs", tostring(doomguardSpellID), GetEstimatedTrackedCooldownRemaining(doomguardSpellID, now) or 0))
+        print(string.format("|cff9d7dffImpTracker:|r Doomguard spellID=%s | Ready in %s", tostring(doomguardSpellID), Advisor.FormatCooldownRemaining(GetEstimatedTrackedCooldownRemaining(doomguardSpellID, now))))
     end
 
     print(string.format("|cff9d7dffImpTracker:|r Wild Imp model = %d casts at %.1fs base cast, %.1f energy per cast", IMP_CASTS_PER_WILD_IMP, IMP_FEL_FIREBOLT_CAST_TIME, IMP_ENERGY_PER_CAST))
@@ -1933,7 +2029,8 @@ local function UpdateTrackedReadyOverlay(spellID, now, adviceState)
     local border = overlay.Border
     local mode = adviceState and adviceState.modes and adviceState.modes[spellID]
     if not mode then
-        mode = IsEstimatedTrackedCooldownReady(spellID, now) and "ready" or "tracking"
+        local remaining = GetEstimatedTrackedCooldownRemaining(spellID, now)
+        mode = remaining == nil and "unknown" or (remaining <= 0 and "ready" or "tracking")
     end
 
     Advisor.SetReadyBorderMode(border, mode, now)
@@ -2365,14 +2462,12 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         local now = GetTime()
         local normalizedSpellID = NormalizeTrackedCastSpellID(spellID)
         local castSpellName = GetSpellNameByID(spellID)
-        if castSpellName and (castSpellName == localizedNames.powerSiphon or castSpellName == FALLBACK_NAMES.powerSiphon) then
-            RememberName("powerSiphon", castSpellName)
-            RememberSpellID("powerSiphon", spellID)
-            trackedSpellAliases[spellID] = POWER_SIPHON_SPELL_ID
+        if spellID == POWER_SIPHON_SPELL_ID or (castSpellName and (castSpellName == localizedNames.powerSiphon or castSpellName == FALLBACK_NAMES.powerSiphon)) then
+            Advisor.MarkActiveTalentSpell("powerSiphon", spellID, castSpellName)
             normalizedSpellID = POWER_SIPHON_SPELL_ID
-        elseif castSpellName and (castSpellName == localizedNames.summonDoomguard or castSpellName == FALLBACK_NAMES.summonDoomguard) then
-            RememberName("summonDoomguard", castSpellName)
-            normalizedSpellID = EnsureDoomguardTracking(spellID) or normalizedSpellID
+        elseif spellID == SUMMON_DOOMGUARD_SPELL_ID or (castSpellName and (castSpellName == localizedNames.summonDoomguard or castSpellName == FALLBACK_NAMES.summonDoomguard)) then
+            Advisor.MarkActiveTalentSpell("summonDoomguard", spellID, castSpellName)
+            normalizedSpellID = GetDoomguardSpellID() or normalizedSpellID
         end
 
         if spellID == DEMONBOLT_SPELL_ID then
